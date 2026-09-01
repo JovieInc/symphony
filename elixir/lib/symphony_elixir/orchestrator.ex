@@ -244,13 +244,19 @@ defmodule SymphonyElixir.Orchestrator do
 
     next_attempt = next_retry_attempt_from_running(running_entry)
 
-    schedule_issue_retry(state, issue_id, next_attempt, %{
-      identifier: running_entry.identifier,
-      issue_url: running_entry.issue.url,
-      error: "agent exited: #{inspect(reason)}",
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
-    })
+    schedule_issue_retry(
+      state,
+      issue_id,
+      next_attempt,
+      %{
+        identifier: running_entry.identifier,
+        issue_url: running_entry.issue.url,
+        error: "agent exited: #{inspect(reason)}",
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path)
+      }
+      |> Map.merge(retry_metadata(reason))
+    )
   end
 
   defp maybe_dispatch(%State{} = state) do
@@ -1277,6 +1283,14 @@ defmodule SymphonyElixir.Orchestrator do
        when is_integer(retry_after_ms) and retry_after_ms > 0 do
     %{retry_after_ms: retry_after_ms}
   end
+
+  defp retry_metadata({%AgentRunner.Error{reason: reason}, stacktrace}) when is_list(stacktrace) do
+    retry_metadata(reason)
+  end
+
+  defp retry_metadata(%AgentRunner.Error{reason: reason}), do: retry_metadata(reason)
+
+  defp retry_metadata({:issue_state_refresh_failed, reason}), do: retry_metadata(reason)
 
   defp retry_metadata(_reason), do: %{}
 

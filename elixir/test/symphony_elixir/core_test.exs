@@ -1138,6 +1138,57 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 9_000, 10_500)
   end
 
+  test "rate-limited worker exit retains the provider retry window" do
+    issue_id = "issue-rate-limited-agent"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitedAgentOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-RATE-LIMITED",
+      issue: %Issue{id: issue_id, identifier: "MT-RATE-LIMITED", state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      worker_host: "worker-a",
+      workspace_path: "/workspaces/MT-RATE-LIMITED"
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    agent_error = %AgentRunner.Error{
+      message: "Agent run failed",
+      reason: {:issue_state_refresh_failed, {:linear_rate_limited, %{status: 400, retry_after_ms: 3_600_000}}}
+    }
+
+    send(pid, {:DOWN, ref, :process, self(), {agent_error, [{AgentRunner, :run, 3, []}]}})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             identifier: "MT-RATE-LIMITED",
+             worker_host: "worker-a",
+             workspace_path: "/workspaces/MT-RATE-LIMITED"
+           } = state.retry_attempts[issue_id]
+
+    assert_due_in_range(due_at_ms, 3_599_000, 3_600_000)
+  end
+
   test "stale retry timer messages do not consume newer retry entries" do
     issue_id = "issue-stale-retry"
     orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)
@@ -1860,9 +1911,12 @@ defmodule SymphonyElixir.CoreTest do
         state: "In Progress"
       }
 
-      assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
-        AgentRunner.run(issue, nil, worker_host: "worker-a")
-      end
+      assert %AgentRunner.Error{
+               reason: {:workspace_prepare_failed, "worker-a", 75, _output}
+             } =
+               assert_raise(AgentRunner.Error, ~r/workspace_prepare_failed/, fn ->
+                 AgentRunner.run(issue, nil, worker_host: "worker-a")
+               end)
 
       trace = File.read!(trace_file)
       assert trace =~ "worker-a bash -lc"
