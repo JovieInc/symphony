@@ -649,7 +649,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
             "type" => "ratelimited",
             "code" => "RATELIMITED",
             "statusCode" => 429,
-            "rateLimitResult" => %{"duration" => 3_600_000, "remaining" => 0}
+            "http" => %{"headers" => %{}, "status" => 400},
+            "meta" => %{
+              "rateLimitResult" => %{
+                "allowed" => false,
+                "duration" => 3_600_000,
+                "limit" => 2_500,
+                "remaining" => 0,
+                "requested" => 1
+              }
+            }
           }
         }
       ]

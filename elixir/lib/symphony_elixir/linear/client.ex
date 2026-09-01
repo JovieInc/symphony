@@ -202,7 +202,11 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp linear_rate_limit_duration(extensions) do
-    case get_in(extensions, ["rateLimitResult", "duration"]) do
+    duration =
+      get_in(extensions, ["meta", "rateLimitResult", "duration"]) ||
+        get_in(extensions, ["rateLimitResult", "duration"])
+
+    case duration do
       duration when is_integer(duration) and duration > 0 -> duration
       _ -> nil
     end
