@@ -1178,6 +1178,101 @@ defmodule SymphonyElixir.CoreTest do
            } = :sys.get_state(pid).retry_attempts[issue_id]
   end
 
+  test "retry exhaustion moves the issue to blocked without scheduling another timer" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retry_attempts: 2
+    )
+
+    issue_id = "issue-retry-exhausted"
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state =
+      Orchestrator.schedule_issue_retry_for_test(state, issue_id, 3, %{
+        identifier: "MT-RETRY",
+        issue_url: "https://example.org/issues/MT-RETRY",
+        error: "tracker unavailable",
+        worker_host: "worker-a",
+        workspace_path: "/workspaces/MT-RETRY"
+      })
+
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+
+    assert %{
+             identifier: "MT-RETRY",
+             issue_url: "https://example.org/issues/MT-RETRY",
+             attempt: 2,
+             error: "retry attempts exhausted: tracker unavailable",
+             worker_host: "worker-a",
+             workspace_path: "/workspaces/MT-RETRY"
+           } = updated_state.blocked[issue_id]
+
+    refute_receive {:retry_issue, ^issue_id, _retry_token}, 50
+  end
+
+  test "tracker retry windows take precedence over exponential backoff" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    issue_id = "issue-provider-backoff"
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state =
+      Orchestrator.schedule_issue_retry_for_test(state, issue_id, 1, %{
+        identifier: "MT-RATE",
+        error: "tracker rate limited",
+        retry_after_ms: 3_600_000
+      })
+
+    retry = updated_state.retry_attempts[issue_id]
+    due_in_ms = retry.due_at_ms - System.monotonic_time(:millisecond)
+
+    assert due_in_ms >= 3_599_000
+    assert due_in_ms <= 3_600_000
+    Process.cancel_timer(retry.timer_ref)
+  end
+
+  test "capacity waits remain queued instead of consuming the failure retry budget" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retry_attempts: 2
+    )
+
+    issue_id = "issue-capacity-wait"
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state =
+      Orchestrator.schedule_issue_retry_for_test(state, issue_id, 3, %{
+        identifier: "MT-CAPACITY",
+        error: "no available orchestrator slots",
+        retry_exhaustible: false
+      })
+
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    assert %{attempt: 3} = retry = updated_state.retry_attempts[issue_id]
+    Process.cancel_timer(retry.timer_ref)
+  end
+
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
     now_ms = System.monotonic_time(:millisecond)
     stale_tick_token = make_ref()

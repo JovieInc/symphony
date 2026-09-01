@@ -623,6 +623,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.max_retry_attempts`: integer, default `8`
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -799,6 +800,9 @@ Backoff formula:
 - Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
+- A tracker-provided retry window takes precedence when it is longer than the exponential delay.
+- After `agent.max_retry_attempts` consecutive failure retries, move the issue into the existing
+  visible blocked state, preserve its identity/workspace/error receipt, and schedule no further timer.
 
 Retry handling behavior:
 

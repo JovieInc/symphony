@@ -296,6 +296,23 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              }
            }
 
+    rate_limit_error =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts ->
+          {:error, {:linear_rate_limited, %{status: 400, retry_after_ms: 3_600_000}}}
+        end
+      )
+
+    assert Jason.decode!(rate_limit_error["output"]) == %{
+             "error" => %{
+               "message" => "Linear GraphQL request was rate limited.",
+               "status" => 400,
+               "retryAfterMs" => 3_600_000
+             }
+           }
+
     request_error =
       DynamicTool.execute(
         "linear_graphql",

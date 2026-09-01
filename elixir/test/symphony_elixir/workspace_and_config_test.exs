@@ -640,6 +640,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear client classifies GraphQL-wrapped rate limits and preserves the retry window" do
+    body = %{
+      "errors" => [
+        %{
+          "message" => "Rate limit exceeded.",
+          "extensions" => %{
+            "type" => "ratelimited",
+            "code" => "RATELIMITED",
+            "statusCode" => 429,
+            "rateLimitResult" => %{"duration" => 3_600_000, "remaining" => 0}
+          }
+        }
+      ]
+    }
+
+    assert {:error, {:linear_rate_limited, %{status: 400, retry_after_ms: 3_600_000}}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               request_fun: fn _payload, _headers ->
+                 {:ok, %{status: 400, body: body}}
+               end
+             )
+  end
+
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
     parent = self()
     original_workflow_path = Workflow.workflow_file_path()
@@ -1119,6 +1144,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       poll_interval_ms: %{bad: true},
       workspace_root: 123,
       max_retry_backoff_ms: 0,
+      max_retry_attempts: 0,
       max_concurrent_agents_by_state: %{"Todo" => "1", "Review" => 0, "Done" => "bad"},
       hook_timeout_ms: 0,
       observability_enabled: "maybe",
