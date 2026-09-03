@@ -314,7 +314,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "polling" => %{"checking?" => false, "next_poll_in_ms" => 30_000}
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
@@ -654,6 +655,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp static_snapshot do
     %{
+      polling: %{checking?: false, next_poll_in_ms: 30_000},
       running: [
         %{
           issue_id: "issue-http",
