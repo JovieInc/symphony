@@ -43,7 +43,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: nil
     )
 
-    assert {:error, :missing_linear_project_slug} = Config.validate!()
+    assert {:error, :missing_linear_scope} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "   ",
@@ -57,7 +57,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: ""
     )
 
-    assert {:error, :missing_linear_project_slug} = Config.validate!()
+    assert {:error, :missing_linear_scope} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_project_slug: "project",
@@ -286,7 +286,7 @@ defmodule SymphonyElixir.CoreTest do
 
     previous_trap_exit = Process.flag(:trap_exit, true)
 
-    assert {:error, :missing_linear_project_slug} =
+    assert {:error, :missing_linear_scope} =
              Orchestrator.start_link(name: orchestrator_name)
 
     Process.flag(:trap_exit, previous_trap_exit)
@@ -324,7 +324,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: nil
     )
 
-    assert {:error, :missing_linear_project_slug} = Config.validate!()
+    assert {:error, :missing_linear_scope} = Config.validate!()
     assert Config.settings!().tracker.kind == "memory"
 
     Process.exit(original_orchestrator_pid, :kill)
@@ -1298,8 +1298,135 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  defp capture_linear_request(invoke) when is_function(invoke, 1) do
+    test_pid = self()
+
+    graphql_fun = fn _query, variables ->
+      send(test_pid, {:linear_request, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, []} = invoke.(graphql_fun)
+    assert_received {:linear_request, variables}
+    %{variables: variables}
+  end
+
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])
+  end
+
+  test "linear team scope validates and fails closed on malformed scope" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: nil,
+      tracker_team_key: "JOV"
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().tracker.team_key == "JOV"
+    assert Config.settings!().tracker.project_slug == nil
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: nil,
+      tracker_team_key: "jov"
+    )
+
+    assert {:error, :invalid_linear_team_key} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: nil,
+      tracker_team_key: "JOV extra"
+    )
+
+    assert {:error, :invalid_linear_team_key} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      tracker_team_key: "JOV"
+    )
+
+    assert {:error, :ambiguous_linear_scope} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: nil,
+      tracker_team_key: nil
+    )
+
+    assert {:error, :missing_linear_scope} = Config.validate!()
+  end
+
+  test "linear scope filter resolves project precedence and team fallback" do
+    assert {:ok, %{project: %{slugId: %{eq: "project"}}}} =
+             Client.tracker_scope_filter_for_test(%{project_slug: "project", team_key: nil})
+
+    assert {:ok, %{team: %{key: %{eq: "JOV"}}}} =
+             Client.tracker_scope_filter_for_test(%{project_slug: nil, team_key: "JOV"})
+
+    assert {:ok, %{team: %{key: %{eq: "JOV"}}}} =
+             Client.tracker_scope_filter_for_test(%{project_slug: "  ", team_key: "JOV"})
+
+    assert {:error, :ambiguous_linear_scope} =
+             Client.tracker_scope_filter_for_test(%{project_slug: "project", team_key: "JOV"})
+
+    assert {:error, :missing_linear_scope} =
+             Client.tracker_scope_filter_for_test(%{project_slug: nil, team_key: nil})
+  end
+
+  test "team-scoped poll sends a team issue filter with state names" do
+    request =
+      capture_linear_request(fn graphql_fun ->
+        Client.fetch_issues_by_states_for_test(
+          %{team: %{key: %{eq: "JOV"}}},
+          ["Todo", "In Progress", "Rework", "Merging"],
+          graphql_fun
+        )
+      end)
+
+    assert request.variables.filter == %{
+             team: %{key: %{eq: "JOV"}},
+             state: %{name: %{in: ["Todo", "In Progress", "Rework", "Merging"]}}
+           }
+  end
+
+  test "project-scoped poll keeps the project slug issue filter" do
+    request =
+      capture_linear_request(fn graphql_fun ->
+        Client.fetch_issues_by_states_for_test(
+          %{project: %{slugId: %{eq: "project"}}},
+          ["Todo"],
+          graphql_fun
+        )
+      end)
+
+    assert request.variables.filter == %{
+             project: %{slugId: %{eq: "project"}},
+             state: %{name: %{in: ["Todo"]}}
+           }
+  end
+
+  test "excluded labels make an issue not routable" do
+    issue = %Issue{
+      id: "1",
+      identifier: "JOV-1",
+      title: "Team intake",
+      state: "Todo",
+      labels: ["no-symphony"],
+      dispatchable: true
+    }
+
+    assert Issue.routable?(issue, [], [])
+    refute Issue.routable?(issue, [], ["no-symphony"])
+    refute Issue.routable?(issue, [], ["No-Symphony"])
+    assert Issue.routable?(%{issue | labels: ["needs-human"]}, [], ["no-symphony"])
+    refute Issue.routable?(%{issue | labels: ["needs-human"]}, [], ["no-symphony", "needs-human"])
   end
 
   test "prompt builder renders issue and attempt values from workflow template" do

@@ -272,6 +272,18 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Tracker project scope missing in WORKFLOW.md")
         state
 
+      {:error, :missing_linear_scope} ->
+        Logger.error("Tracker Linear scope (project_slug or team_key) missing in WORKFLOW.md")
+        state
+
+      {:error, :ambiguous_linear_scope} ->
+        Logger.error("Tracker Linear scope ambiguous in WORKFLOW.md: set only one of project_slug or team_key")
+        state
+
+      {:error, :invalid_linear_team_key} ->
+        Logger.error("Tracker team_key malformed in WORKFLOW.md")
+        state
+
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
@@ -870,7 +882,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    tracker = Config.settings!().tracker
+    Issue.routable?(issue, tracker.required_labels, tracker.excluded_labels)
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do

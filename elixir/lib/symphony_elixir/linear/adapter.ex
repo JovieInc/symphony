@@ -17,8 +17,17 @@ defmodule SymphonyElixir.Linear.Adapter do
       not present_string?(tracker_settings.api_key) ->
         {:error, :missing_linear_api_token}
 
-      not present_string?(tracker_settings.project_slug) ->
-        {:error, :missing_linear_project_slug}
+      not present_string?(tracker_settings.project_slug) and
+          not present_string?(tracker_settings.team_key) ->
+        {:error, :missing_linear_scope}
+
+      present_string?(tracker_settings.project_slug) and
+          present_string?(tracker_settings.team_key) ->
+        {:error, :ambiguous_linear_scope}
+
+      present_string?(tracker_settings.team_key) and
+          not valid_team_key?(tracker_settings.team_key) ->
+        {:error, :invalid_linear_team_key}
 
       not is_nil(tracker_settings.assignee) and not present_string?(tracker_settings.assignee) ->
         {:error, :invalid_linear_assignee}
@@ -51,4 +60,11 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
   defp present_string?(_value), do: false
+
+  # Linear team keys are short uppercase identifiers (for example "ENG", "JOV").
+  # Anything else fails closed so a malformed team scope can never widen or
+  # silently empty the intake scope.
+  defp valid_team_key?(value) when is_binary(value) do
+    String.match?(String.trim(value), ~r/^[A-Z][A-Z0-9]*$/)
+  end
 end

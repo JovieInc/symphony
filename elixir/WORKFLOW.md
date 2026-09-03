@@ -3,7 +3,11 @@ tracker:
   kind: linear
   provider:
     project_slug: "symphony-0c79b11b75ea"
+    # Use team_key instead of project_slug to poll every active issue in a Linear team.
+    # team_key: "ENG"
   required_labels: []
+  # Optional exclusion gates; a matching issue is never dispatched.
+  # excluded_labels: ["human-only"]
   active_states:
     - Todo
     - In Progress

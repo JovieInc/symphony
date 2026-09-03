@@ -146,9 +146,16 @@ Notes:
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
+- `tracker.provider.project_slug` is the default Linear scope. When it is unset,
+  `tracker.provider.team_key` (for example `"ENG"`) polls every active issue in
+  that Linear team instead. Exactly one scope must be configured; a missing,
+  ambiguous, or malformed team key fails validation closed.
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `tracker.excluded_labels` is optional. When set, an issue carrying any
+  configured label is never dispatched and stops running. Matching follows
+  `tracker.required_labels` semantics.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -204,8 +211,8 @@ codex:
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default
   `https://api.linear.app/graphql`), `api_key` (defaults to `LINEAR_API_KEY` and accepts
-  `$VAR`), required `project_slug`, and optional `assignee` (a Linear user ID or `me`,
-  defaulting to `LINEAR_ASSIGNEE`).
+  `$VAR`), exactly one of `project_slug` or `team_key`, and optional `assignee` (a
+  Linear user ID or `me`, defaulting to `LINEAR_ASSIGNEE`).
   The legacy flat `tracker.endpoint`, `api_key`, `project_slug`, and `assignee` aliases remain
   supported. `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
 - Scope and paging: candidate reads filter the configured project slug and requested state names,
