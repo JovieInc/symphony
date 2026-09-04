@@ -1054,9 +1054,8 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert %{attempt: 1, due_at_ms: due_at_ms, delay_ms: 1_000} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1093,10 +1092,16 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 3,
+             due_at_ms: due_at_ms,
+             delay_ms: 40_000,
+             identifier: "MT-559",
+             error: "agent exited: :boom"
+           } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert is_integer(due_at_ms)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1132,10 +1137,159 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             delay_ms: 10_000,
+             identifier: "MT-560",
+             error: "agent exited: :boom"
+           } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert is_integer(due_at_ms)
+  end
+
+  test "rate-limited worker exit retains the provider retry window" do
+    issue_id = "issue-rate-limited-agent"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitedAgentOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-RATE-LIMITED",
+      issue: %Issue{id: issue_id, identifier: "MT-RATE-LIMITED", state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      worker_host: "worker-a",
+      workspace_path: "/workspaces/MT-RATE-LIMITED"
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    agent_error = %AgentRunner.Error{
+      message: "Agent run failed",
+      reason: {:issue_state_refresh_failed, {:linear_rate_limited, %{status: 400, retry_after_ms: 3_600_000}}}
+    }
+
+    send(pid, {:DOWN, ref, :process, self(), {agent_error, [{AgentRunner, :run, 3, []}]}})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             delay_ms: 3_600_000,
+             identifier: "MT-RATE-LIMITED",
+             worker_host: "worker-a",
+             workspace_path: "/workspaces/MT-RATE-LIMITED"
+           } = state.retry_attempts[issue_id]
+
+    assert_due_in_range(due_at_ms, 3_599_000, 3_600_000)
+    assert_due_in_range(state.tracker_retry_until_ms, 3_599_000, 3_600_000)
+  end
+
+  test "tracker cooldown stops batch dispatch after the first rate-limit signal" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_concurrent_agents: 3
+    )
+
+    issues =
+      for index <- 1..3 do
+        %Issue{
+          id: "issue-budget-#{index}",
+          identifier: "MT-BUDGET-#{index}",
+          title: "Budget-aware dispatch #{index}",
+          state: "In Progress",
+          labels: [],
+          dispatchable: true
+        }
+      end
+
+    {:ok, request_counter} = Agent.start_link(fn -> 0 end)
+
+    issue_fetcher = fn [_issue_id] ->
+      Agent.update(request_counter, &(&1 + 1))
+      {:error, {:linear_rate_limited, %{status: 400, retry_after_ms: 3_600_000}}}
+    end
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state = Orchestrator.choose_issues_for_test(issues, state, issue_fetcher)
+
+    assert Agent.get(request_counter, & &1) == 1
+    assert updated_state.running == %{}
+    assert_due_in_range(updated_state.tracker_retry_until_ms, 3_599_000, 3_600_000)
+    Process.cancel_timer(updated_state.tick_timer_ref)
+  end
+
+  test "agent tracker refreshes share the orchestrator budget cooldown" do
+    now_ms = System.monotonic_time(:millisecond)
+
+    state = %Orchestrator.State{
+      tracker_retry_until_ms: now_ms + 60_000,
+      running: %{},
+      claimed: MapSet.new(),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:error, {:linear_rate_limited, %{retry_after_ms: retry_after_ms}}}, returned_state} =
+             Orchestrator.handle_call(
+               {:fetch_agent_issue_states, ["issue-budget-1"]},
+               {self(), make_ref()},
+               state
+             )
+
+    assert returned_state == state
+    assert retry_after_ms >= 59_000
+    assert retry_after_ms <= 60_000
+  end
+
+  test "manual refresh preserves the shared tracker wake-up boundary" do
+    now_ms = System.monotonic_time(:millisecond)
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      next_poll_due_at_ms: now_ms + 5_000,
+      poll_check_in_progress: false,
+      tick_timer_ref: nil,
+      tick_token: nil,
+      tracker_retry_until_ms: now_ms + 60_000,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+
+    assert {:reply, %{queued: true, coalesced: true, tracker_retry_in_ms: retry_after_ms}, refreshed_state} =
+             Orchestrator.handle_call(:request_refresh, {self(), make_ref()}, state)
+
+    assert retry_after_ms >= 59_000
+    assert retry_after_ms <= 60_000
+    assert_due_in_range(refreshed_state.next_poll_due_at_ms, 59_000, 60_000)
+    Process.cancel_timer(refreshed_state.tick_timer_ref)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1176,6 +1330,101 @@ defmodule SymphonyElixir.CoreTest do
              identifier: "MT-561",
              error: "agent exited: :boom"
            } = :sys.get_state(pid).retry_attempts[issue_id]
+  end
+
+  test "retry exhaustion moves the issue to blocked without scheduling another timer" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retry_attempts: 2
+    )
+
+    issue_id = "issue-retry-exhausted"
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state =
+      Orchestrator.schedule_issue_retry_for_test(state, issue_id, 3, %{
+        identifier: "MT-RETRY",
+        issue_url: "https://example.org/issues/MT-RETRY",
+        error: "tracker unavailable",
+        worker_host: "worker-a",
+        workspace_path: "/workspaces/MT-RETRY"
+      })
+
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+
+    assert %{
+             identifier: "MT-RETRY",
+             issue_url: "https://example.org/issues/MT-RETRY",
+             attempt: 2,
+             error: "retry attempts exhausted: tracker unavailable",
+             worker_host: "worker-a",
+             workspace_path: "/workspaces/MT-RETRY"
+           } = updated_state.blocked[issue_id]
+
+    refute_receive {:retry_issue, ^issue_id, _retry_token}, 50
+  end
+
+  test "tracker retry windows take precedence over exponential backoff" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    issue_id = "issue-provider-backoff"
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state =
+      Orchestrator.schedule_issue_retry_for_test(state, issue_id, 1, %{
+        identifier: "MT-RATE",
+        error: "tracker rate limited",
+        retry_after_ms: 3_600_000
+      })
+
+    retry = updated_state.retry_attempts[issue_id]
+    due_in_ms = retry.due_at_ms - System.monotonic_time(:millisecond)
+
+    assert due_in_ms >= 3_599_000
+    assert due_in_ms <= 3_600_000
+    Process.cancel_timer(retry.timer_ref)
+  end
+
+  test "capacity waits remain queued instead of consuming the failure retry budget" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retry_attempts: 2
+    )
+
+    issue_id = "issue-capacity-wait"
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state =
+      Orchestrator.schedule_issue_retry_for_test(state, issue_id, 3, %{
+        identifier: "MT-CAPACITY",
+        error: "no available orchestrator slots",
+        retry_exhaustible: false
+      })
+
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    assert %{attempt: 3} = retry = updated_state.retry_attempts[issue_id]
+    Process.cancel_timer(retry.timer_ref)
   end
 
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
@@ -1765,9 +2014,12 @@ defmodule SymphonyElixir.CoreTest do
         state: "In Progress"
       }
 
-      assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
-        AgentRunner.run(issue, nil, worker_host: "worker-a")
-      end
+      assert %AgentRunner.Error{
+               reason: {:workspace_prepare_failed, "worker-a", 75, _output}
+             } =
+               assert_raise(AgentRunner.Error, ~r/workspace_prepare_failed/, fn ->
+                 AgentRunner.run(issue, nil, worker_host: "worker-a")
+               end)
 
       trace = File.read!(trace_file)
       assert trace =~ "worker-a bash -lc"

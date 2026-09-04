@@ -135,7 +135,7 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp blocked_entry_payload(entry) do
-    %{
+    payload = %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       issue_url: Map.get(entry, :issue_url),
@@ -149,6 +149,11 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       last_event_at: iso8601(entry.last_codex_timestamp)
     }
+
+    case Map.get(entry, :attempt) do
+      attempt when is_integer(attempt) -> Map.put(payload, :attempt, attempt)
+      _ -> payload
+    end
   end
 
   defp running_issue_payload(running) do

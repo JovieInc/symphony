@@ -148,20 +148,74 @@ defmodule SymphonyElixir.Linear.Client do
       end)
 
     with {:ok, headers} <- graphql_headers(tracker_settings),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
-      {:ok, body}
+         {:ok, response} <- request_fun.(payload, headers) do
+      case response do
+        %{status: 200, body: body} ->
+          {:ok, body}
+
+        response ->
+          Logger.error(
+            "Linear GraphQL request failed status=#{response.status}" <>
+              linear_error_context(payload, response)
+          )
+
+          {:error, linear_response_error(response)}
+      end
     else
-      {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
-        )
-
-        {:error, {:linear_api_status, response.status}}
-
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
         {:error, {:linear_api_request, reason}}
+    end
+  end
+
+  defp linear_response_error(%{status: status, body: body}) do
+    case linear_rate_limit_details(body) do
+      {:rate_limited, retry_after_ms} ->
+        {:linear_rate_limited, %{status: status, retry_after_ms: retry_after_ms}}
+
+      :not_rate_limited when status == 429 ->
+        {:linear_rate_limited, %{status: status, retry_after_ms: nil}}
+
+      _ ->
+        {:linear_api_status, status}
+    end
+  end
+
+  defp linear_rate_limit_details(%{"errors" => errors}) when is_list(errors) do
+    Enum.find_value(errors, fn
+      %{"extensions" => extensions} when is_map(extensions) ->
+        if linear_rate_limited_extensions?(extensions) do
+          {:rate_limited, linear_rate_limit_duration(extensions)}
+        end
+
+      _ ->
+        nil
+    end) || :not_rate_limited
+  end
+
+  defp linear_rate_limit_details(body) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, decoded_body} -> linear_rate_limit_details(decoded_body)
+      {:error, _reason} -> :not_rate_limited
+    end
+  end
+
+  defp linear_rate_limit_details(_body), do: :not_rate_limited
+
+  defp linear_rate_limited_extensions?(extensions) do
+    extensions["code"] == "RATELIMITED" or
+      extensions["type"] == "ratelimited" or
+      extensions["statusCode"] == 429
+  end
+
+  defp linear_rate_limit_duration(extensions) do
+    duration =
+      get_in(extensions, ["meta", "rateLimitResult", "duration"]) ||
+        get_in(extensions, ["rateLimitResult", "duration"])
+
+    case duration do
+      duration when is_integer(duration) and duration > 0 -> duration
+      _ -> nil
     end
   end
 

@@ -76,6 +76,76 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "completed protocol frames with failed turn status remain failures" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-failed-completion-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-USAGE-LIMIT")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-usage-limit"}}}' ;;
+          4)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-usage-limit"}}}'
+            printf '%s\n' '{"method":"error","params":{"error":{"message":"usage exhausted","codexErrorInfo":"usageLimitExceeded"},"willRetry":false}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-usage-limit","items":[],"status":"failed","error":{"message":"usage exhausted","codexErrorInfo":"usageLimitExceeded"}}}}'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-usage-limit",
+        identifier: "MT-USAGE-LIMIT",
+        title: "Preserve failed completion status",
+        description: "Do not continue after a provider failure",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-USAGE-LIMIT",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error,
+              {:turn_failed,
+               %{
+                 "codexErrorInfo" => "usageLimitExceeded",
+                 "message" => "usage exhausted"
+               }}} =
+               AppServer.run(workspace, "Do not continue", issue, on_message: on_message)
+
+      assert_received {:app_server_message, %{event: :notification}}
+      assert_received {:app_server_message, %{event: :turn_failed}}
+      assert_received {:app_server_message, %{event: :turn_ended_with_error}}
+      refute_received {:app_server_message, %{event: :turn_completed}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "turn timeout resets on stream updates and fires after silence" do
     test_root =
       Path.join(
