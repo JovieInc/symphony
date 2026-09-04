@@ -1149,6 +1149,120 @@ defmodule SymphonyElixir.CoreTest do
     assert is_integer(due_at_ms)
   end
 
+  test "EX_CONFIG app-server exit blocks the issue and preserves failed-turn context" do
+    issue_id = "issue-port-exit-78"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :PortExit78Orchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-EX-CONFIG",
+      issue: %Issue{id: issue_id, identifier: "MT-EX-CONFIG", state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      worker_host: "worker-a",
+      workspace_path: "/workspaces/MT-EX-CONFIG",
+      session_id: "session-ex-config",
+      last_codex_message: %{"method" => "turn/completed", "params" => %{"status" => "failed"}},
+      last_codex_event: :turn_ended_with_error,
+      last_codex_timestamp: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    agent_error = %AgentRunner.Error{
+      message: "Agent run failed",
+      reason: {:port_exit, 78}
+    }
+
+    send(pid, {:DOWN, ref, :process, self(), {agent_error, [{AgentRunner, :run, 3, []}]}})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{
+             identifier: "MT-EX-CONFIG",
+             worker_host: "worker-a",
+             workspace_path: "/workspaces/MT-EX-CONFIG",
+             session_id: "session-ex-config",
+             last_codex_event: :turn_ended_with_error,
+             last_codex_message: %{"method" => "turn/completed"},
+             error: error
+           } = state.blocked[issue_id]
+
+    assert error =~ "terminal agent configuration failure"
+    assert error =~ "port_exit"
+    assert error =~ "78"
+    refute_receive {:retry_issue, ^issue_id, _retry_token}, 50
+  end
+
+  test "non-EX_CONFIG app-server exit remains retryable" do
+    issue_id = "issue-port-exit-transient"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :TransientPortExitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-TRANSIENT",
+      issue: %Issue{id: issue_id, identifier: "MT-TRANSIENT", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    agent_error = %AgentRunner.Error{
+      message: "Agent run failed",
+      reason: {:port_exit, 75}
+    }
+
+    send(pid, {:DOWN, ref, :process, self(), {agent_error, [{AgentRunner, :run, 3, []}]}})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.blocked, issue_id)
+
+    assert %{
+             attempt: 1,
+             delay_ms: 10_000,
+             error: error
+           } = state.retry_attempts[issue_id]
+
+    assert error =~ "port_exit"
+    assert error =~ "75"
+  end
+
   test "rate-limited worker exit retains the provider retry window" do
     issue_id = "issue-rate-limited-agent"
     ref = make_ref()

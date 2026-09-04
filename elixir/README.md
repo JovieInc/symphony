@@ -168,6 +168,9 @@ Notes:
 - `agent.max_retry_attempts` caps consecutive failure retries before Symphony moves the issue into
   its visible blocked state. Default: `8`. The blocked receipt preserves issue and workspace identity,
   and no further retry timer is scheduled until an operator or tracker-state change resolves it.
+- A Codex app-server launcher exit with `EX_CONFIG` status `78` is terminal for the unchanged
+  configuration. Symphony preserves the failed-turn context in the visible blocked state instead of
+  scheduling an identical retry; other non-zero launcher exits continue through normal backoff.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
