@@ -193,6 +193,13 @@ defmodule SymphonyElixir.Linear.Client do
     end) || :not_rate_limited
   end
 
+  defp linear_rate_limit_details(body) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, decoded_body} -> linear_rate_limit_details(decoded_body)
+      {:error, _reason} -> :not_rate_limited
+    end
+  end
+
   defp linear_rate_limit_details(_body), do: :not_rate_limited
 
   defp linear_rate_limited_extensions?(extensions) do

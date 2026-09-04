@@ -672,6 +672,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                  {:ok, %{status: 400, body: body}}
                end
              )
+
+    assert {:error, {:linear_rate_limited, %{status: 400, retry_after_ms: 3_600_000}}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               request_fun: fn _payload, _headers ->
+                 {:ok, %{status: 400, body: Jason.encode!(body)}}
+               end
+             )
   end
 
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
