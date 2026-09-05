@@ -1948,7 +1948,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp -R #{template_repo}/. .",
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -2033,7 +2033,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp -R #{template_repo}/. .",
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -2202,7 +2202,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp -R #{template_repo}/. .",
         codex_command: "#{codex_binary} app-server",
         max_turns: 3
       )
@@ -2333,7 +2333,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp -R #{template_repo}/. .",
         codex_command: "#{codex_binary} app-server",
         max_turns: 2
       )
@@ -2396,7 +2396,7 @@ defmodule SymphonyElixir.CoreTest do
       end)
 
       System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -2484,9 +2484,9 @@ defmodule SymphonyElixir.CoreTest do
 
       expected_turn_sandbox_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [canonical_workspace],
+        "writableRoots" => [canonical_workspace, Path.join(canonical_workspace, ".git")],
         "readOnlyAccess" => %{"type" => "fullAccess"},
-        "networkAccess" => false,
+        "networkAccess" => true,
         "excludeTmpdirEnvVar" => false,
         "excludeSlashTmp" => false
       }
@@ -2542,7 +2542,7 @@ defmodule SymphonyElixir.CoreTest do
       end)
 
       System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -2627,7 +2627,7 @@ defmodule SymphonyElixir.CoreTest do
       end)
 
       System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -2704,9 +2704,13 @@ defmodule SymphonyElixir.CoreTest do
                end
              end)
 
+      assert {:ok, canonical_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(workspace)
+
       expected_turn_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [Path.expand(workspace), workspace_cache]
+        "writableRoots" => [canonical_workspace, Path.join(canonical_workspace, ".git")],
+        "networkAccess" => true
       }
 
       assert Enum.any?(lines, fn line ->

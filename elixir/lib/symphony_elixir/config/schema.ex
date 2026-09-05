@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   import Ecto.Changeset
 
-  alias SymphonyElixir.PathSafety
+  alias SymphonyElixir.GitMetadata
 
   @primary_key false
   @linear_endpoint "https://api.linear.app/graphql"
@@ -56,6 +56,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
+      field(:excluded_labels, {:array, :string}, default: ["no-symphony", "codex-in-progress"])
       field(:active_states, {:array, :string})
       field(:terminal_states, {:array, :string})
     end
@@ -73,12 +74,18 @@ defmodule SymphonyElixir.Config.Schema do
           :assignee,
           :provider,
           :required_labels,
+          :excluded_labels,
           :active_states,
           :terminal_states
         ],
         empty_values: []
       )
       |> update_change(:required_labels, fn labels ->
+        labels
+        |> Enum.map(&(String.trim(&1) |> String.downcase()))
+        |> Enum.uniq()
+      end)
+      |> update_change(:excluded_labels, fn labels ->
         labels
         |> Enum.map(&(String.trim(&1) |> String.downcase()))
         |> Enum.uniq()
@@ -342,14 +349,15 @@ defmodule SymphonyElixir.Config.Schema do
   @spec resolve_runtime_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil, keyword()) ::
           {:ok, map()} | {:error, term()}
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
-    case settings.codex.turn_sandbox_policy do
-      %{} = policy ->
-        {:ok, policy}
+    resolved_workspace = default_workspace_root(workspace, settings.workspace.root)
 
-      _ ->
-        workspace
-        |> default_workspace_root(settings.workspace.root)
-        |> default_runtime_turn_sandbox_policy(opts)
+    if Keyword.get(opts, :remote, false) do
+      existing_remote_turn_sandbox_policy(settings.codex.turn_sandbox_policy, resolved_workspace)
+    else
+      with {:ok, writable_roots} <-
+             GitMetadata.writable_roots(resolved_workspace, settings.workspace.root) do
+        {:ok, source_runtime_turn_sandbox_policy(settings.codex.turn_sandbox_policy, writable_roots)}
+      end
     end
   end
 
@@ -586,19 +594,21 @@ defmodule SymphonyElixir.Config.Schema do
     }
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
-    if Keyword.get(opts, :remote, false) do
-      {:ok, default_turn_sandbox_policy(workspace_root)}
-    else
-      with expanded_workspace_root <- expand_local_workspace_root(workspace_root),
-           {:ok, canonical_workspace_root} <- PathSafety.canonicalize(expanded_workspace_root) do
-        {:ok, default_turn_sandbox_policy(canonical_workspace_root)}
-      end
-    end
+  defp source_runtime_turn_sandbox_policy(policy, writable_roots) do
+    (policy || default_turn_sandbox_policy(List.first(writable_roots)))
+    |> Map.put("type", "workspaceWrite")
+    |> Map.put("writableRoots", writable_roots)
+    |> Map.put("networkAccess", true)
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
-    {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
+  defp existing_remote_turn_sandbox_policy(%{} = policy, _workspace), do: {:ok, policy}
+
+  defp existing_remote_turn_sandbox_policy(_policy, workspace) when is_binary(workspace) do
+    {:ok, default_turn_sandbox_policy(workspace)}
+  end
+
+  defp existing_remote_turn_sandbox_policy(_policy, workspace) do
+    {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace}}}
   end
 
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",
