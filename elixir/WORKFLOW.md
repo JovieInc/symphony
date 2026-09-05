@@ -4,6 +4,9 @@ tracker:
   provider:
     project_slug: "symphony-0c79b11b75ea"
   required_labels: []
+  excluded_labels:
+    - no-symphony
+    - codex-in-progress
   active_states:
     - Todo
     - In Progress

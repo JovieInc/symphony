@@ -149,20 +149,24 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `tracker.excluded_labels` blocks admission or continuation when an issue has any listed label. It
+  defaults to `no-symphony` and `codex-in-progress`, preserving explicit opt-outs and protected Codex
+  ownership across maintenance.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
-  - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
+  - `codex.turn_sandbox_policy` resolves to a `workspaceWrite` policy rooted at the canonical issue
+    workspace and its verified Git metadata directory, with network access enabled for source fetches
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
-- When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
-  unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
-  Symphony validation.
-- Workflows that run package managers or other commands that resolve external hosts should set
-  `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
-  by the Codex turn sandbox.
+- When `codex.turn_sandbox_policy` is set explicitly, Symphony preserves its other fields but sets
+  `type: workspaceWrite`, replaces `writableRoots` with the exact canonical issue workspace and
+  verified Git metadata path, and sets `networkAccess: true`. A normal clone must have a real
+  `.git` directory inside the issue workspace. A linked gitdir is accepted only at the exact
+  broker-owned `<workspace-root>/.broker/git/<issue-directory>` path; foreign sibling, traversal,
+  and symlink escapes fail closed.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - `agent.max_retry_attempts` caps consecutive failure retries before Symphony moves the issue into

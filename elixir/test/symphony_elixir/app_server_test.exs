@@ -87,7 +87,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-USAGE-LIMIT")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -157,7 +157,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-TIMEOUT")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -235,7 +235,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server passes explicit turn sandbox policies through unchanged" do
+  test "app server preserves explicit policy fields and pins exact source roots" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -258,7 +258,7 @@ defmodule SymphonyElixir.AppServerTest do
       end)
 
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -295,18 +295,16 @@ defmodule SymphonyElixir.AppServerTest do
       issue = %Issue{
         id: "issue-supported-turn-policies",
         identifier: "MT-1001",
-        title: "Validate explicit turn sandbox policy passthrough",
-        description: "Ensure runtime startup forwards configured turn sandbox policies unchanged",
+        title: "Validate exact source sandbox roots",
+        description: "Ensure runtime startup pins safe roots while preserving other policy fields",
         state: "In Progress",
         url: "https://example.org/issues/MT-1001",
         labels: ["backend"]
       }
 
       policy_cases = [
-        %{"type" => "dangerFullAccess"},
-        %{"type" => "externalSandbox", "profile" => "remote-ci"},
-        %{"type" => "workspaceWrite", "writableRoots" => ["relative/path"], "networkAccess" => true},
-        %{"type" => "futureSandbox", "nested" => %{"flag" => true}}
+        %{"type" => "workspaceWrite", "writableRoots" => ["relative/path"], "networkAccess" => false},
+        %{"type" => "workspaceWrite", "nested" => %{"flag" => true}}
       ]
 
       Enum.each(policy_cases, fn configured_policy ->
@@ -323,6 +321,16 @@ defmodule SymphonyElixir.AppServerTest do
         trace = File.read!(trace_file)
         lines = String.split(trace, "\n", trim: true)
 
+        assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+
+        expected_policy =
+          configured_policy
+          |> Map.put("writableRoots", [
+            canonical_workspace,
+            Path.join(canonical_workspace, ".git")
+          ])
+          |> Map.put("networkAccess", true)
+
         assert Enum.any?(lines, fn line ->
                  if String.starts_with?(line, "JSON:") do
                    line
@@ -330,7 +338,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
                    |> then(fn payload ->
                      payload["method"] == "turn/start" &&
-                       get_in(payload, ["params", "sandboxPolicy"]) == configured_policy
+                       get_in(payload, ["params", "sandboxPolicy"]) == expected_policy
                    end)
                  else
                    false
@@ -365,7 +373,7 @@ defmodule SymphonyElixir.AppServerTest do
       end)
 
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -432,7 +440,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-188")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -497,7 +505,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-89")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -572,7 +580,7 @@ defmodule SymphonyElixir.AppServerTest do
       end)
 
       System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -709,7 +717,7 @@ defmodule SymphonyElixir.AppServerTest do
       end)
 
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -796,7 +804,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-718")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -866,7 +874,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-719")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -948,7 +956,7 @@ defmodule SymphonyElixir.AppServerTest do
       end)
 
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1049,7 +1057,7 @@ defmodule SymphonyElixir.AppServerTest do
       end)
 
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1171,7 +1179,7 @@ defmodule SymphonyElixir.AppServerTest do
       end)
 
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1265,7 +1273,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-91")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1329,7 +1337,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-92")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1404,7 +1412,7 @@ defmodule SymphonyElixir.AppServerTest do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-93")
       codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1493,7 +1501,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file = Path.join(test_root, "codex-secret-env.trace")
 
       File.mkdir_p!(bash_home)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.join(workspace, ".git"))
 
       File.write!(Path.join(bash_home, ".bash_profile"), """
       export LINEAR_API_KEY='profile-canonical-secret-that-must-not-reach-child'
