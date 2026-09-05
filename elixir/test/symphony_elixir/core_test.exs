@@ -1358,6 +1358,67 @@ defmodule SymphonyElixir.CoreTest do
     Process.cancel_timer(updated_state.tick_timer_ref)
   end
 
+  test "duplicate candidates dispatch once across repeated reconciliation" do
+    issue_suffix = System.unique_integer([:positive])
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-deduplicated-dispatch-#{issue_suffix}")
+
+    issue = %Issue{
+      id: "issue-deduplicated-#{issue_suffix}",
+      identifier: "MT-DEDUP-#{issue_suffix}",
+      title: "Dispatch this issue once",
+      state: "In Progress",
+      labels: [],
+      dispatchable: true
+    }
+
+    {:ok, request_counter} = Agent.start_link(fn -> 0 end)
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+
+    on_exit(fn ->
+      if Process.alive?(task_supervisor), do: Supervisor.stop(task_supervisor)
+      File.rm_rf(test_root)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      max_concurrent_agents: 2,
+      hook_after_create: "mkdir -p .git",
+      hook_before_run: "exit 1"
+    )
+
+    issue_fetcher = fn [issue_id] ->
+      Agent.update(request_counter, &(&1 + 1))
+      assert issue_id == issue.id
+      {:ok, [issue]}
+    end
+
+    initial_state = %Orchestrator.State{
+      max_concurrent_agents: 2,
+      task_supervisor: task_supervisor,
+      running: %{},
+      claimed: MapSet.new(),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    first_state =
+      Orchestrator.choose_issues_for_test([issue, issue], initial_state, issue_fetcher)
+
+    assert Agent.get(request_counter, & &1) == 1
+    assert MapSet.equal?(first_state.claimed, MapSet.new([issue.id]))
+    assert %{pid: worker_pid} = first_state.running[issue.id]
+    assert is_pid(worker_pid)
+
+    repeated_state =
+      Orchestrator.choose_issues_for_test([issue, issue], first_state, issue_fetcher)
+
+    assert Agent.get(request_counter, & &1) == 1
+    assert repeated_state.running == first_state.running
+    assert repeated_state.claimed == first_state.claimed
+  end
+
   test "agent tracker refreshes share the orchestrator budget cooldown" do
     now_ms = System.monotonic_time(:millisecond)
 
