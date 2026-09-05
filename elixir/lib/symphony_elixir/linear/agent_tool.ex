@@ -186,6 +186,16 @@ defmodule SymphonyElixir.Linear.AgentTool do
     }
   end
 
+  defp tool_error_payload({:linear_rate_limited, details}) when is_map(details) do
+    %{
+      "error" => %{
+        "message" => "Linear GraphQL request was rate limited.",
+        "status" => Map.get(details, :status),
+        "retryAfterMs" => Map.get(details, :retry_after_ms)
+      }
+    }
+  end
+
   defp tool_error_payload({:linear_api_request, reason}) do
     %{
       "error" => %{

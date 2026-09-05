@@ -1,9 +1,18 @@
+defmodule SymphonyElixir.AgentRunner.Error do
+  @moduledoc false
+
+  defexception [:message, :reason]
+
+  @type t :: %__MODULE__{message: String.t(), reason: term()}
+end
+
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
   Executes a single tracker work item in its workspace with Codex.
   """
 
   require Logger
+  alias SymphonyElixir.AgentRunner.Error
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
@@ -31,7 +40,10 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+
+        raise Error,
+          message: "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}",
+          reason: reason
     end
   end
 
