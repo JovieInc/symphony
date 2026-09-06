@@ -267,8 +267,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
+                 "title" => "Render observability state",
                  "issue_url" => "https://example.org/issues/MT-HTTP",
                  "state" => "In Progress",
+                 "stage" => "implementing",
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
@@ -284,7 +286,9 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-retry",
                  "issue_identifier" => "MT-RETRY",
+                 "title" => "Retry with source context",
                  "issue_url" => "https://example.org/issues/MT-RETRY",
+                 "stage" => "retrying",
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
@@ -296,8 +300,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-blocked",
                  "issue_identifier" => "MT-BLOCKED",
+                 "title" => "Expose blocked work",
                  "issue_url" => "https://example.org/issues/MT-BLOCKED",
                  "state" => "In Progress",
+                 "stage" => "blocked",
                  "error" => "codex turn requires operator input",
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
@@ -323,7 +329,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_payload == %{
              "issue_identifier" => "MT-HTTP",
              "issue_id" => "issue-http",
+             "title" => "Render observability state",
              "status" => "running",
+             "stage" => "implementing",
              "workspace" => %{
                "path" => Path.join(Config.settings!().workspace.root, "MT-HTTP"),
                "host" => nil
@@ -335,6 +343,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "session_id" => "thread-http",
                "turn_count" => 7,
                "state" => "In Progress",
+               "stage" => "implementing",
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
                "last_message" => "rendered",
@@ -376,6 +385,43 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "presenter labels pre-session work as bootstrapping and preserves unknown title" do
+    orchestrator_name = Module.concat(__MODULE__, :BootstrappingPresenterOrchestrator)
+
+    snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-bootstrap",
+          identifier: "MT-BOOT",
+          title: nil,
+          issue_url: nil,
+          state: "In Progress",
+          session_id: nil,
+          turn_count: 0,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          last_codex_event: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          started_at: DateTime.utc_now()
+        }
+      ],
+      retrying: [],
+      blocked: [],
+      codex_totals: %{},
+      rate_limits: nil
+    }
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+
+    assert %{
+             running: [%{title: nil, stage: "bootstrapping"}],
+             retrying: [],
+             blocked: []
+           } = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 50)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -658,6 +704,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         %{
           issue_id: "issue-http",
           identifier: "MT-HTTP",
+          title: "Render observability state",
           issue_url: "https://example.org/issues/MT-HTTP",
           state: "In Progress",
           session_id: "thread-http",
@@ -676,6 +723,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         %{
           issue_id: "issue-retry",
           identifier: "MT-RETRY",
+          title: "Retry with source context",
           issue_url: "https://example.org/issues/MT-RETRY",
           attempt: 2,
           due_in_ms: 2_000,
@@ -686,6 +734,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         %{
           issue_id: "issue-blocked",
           identifier: "MT-BLOCKED",
+          title: "Expose blocked work",
           issue_url: "https://example.org/issues/MT-BLOCKED",
           state: "In Progress",
           error: "codex turn requires operator input",

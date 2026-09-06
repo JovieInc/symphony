@@ -1077,7 +1077,7 @@ defmodule SymphonyElixir.CoreTest do
       ref: ref,
       identifier: "MT-559",
       retry_attempt: 2,
-      issue: %Issue{id: issue_id, identifier: "MT-559", state: "In Progress"},
+      issue: %Issue{id: issue_id, identifier: "MT-559", title: "Repair crash loop", state: "In Progress"},
       session_id: "thread-crash-turn-crash",
       last_codex_event: :session_started,
       turn_count: 1,
@@ -1100,6 +1100,7 @@ defmodule SymphonyElixir.CoreTest do
              due_at_ms: due_at_ms,
              delay_ms: 40_000,
              identifier: "MT-559",
+             title: "Repair crash loop",
              error: "agent exited: :boom"
            } =
              state.retry_attempts[issue_id]

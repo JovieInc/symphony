@@ -1524,8 +1524,10 @@ Minimum endpoints:
         {
           "issue_id": "abc123",
           "issue_identifier": "MT-649",
+          "title": "Keep the operator HUD truthful",
           "issue_url": "https://tracker.example/issues/MT-649",
           "state": "In Progress",
+          "stage": "implementing",
           "session_id": "thread-1-turn-1",
           "turn_count": 7,
           "last_event": "turn_completed",
@@ -1543,7 +1545,9 @@ Minimum endpoints:
         {
           "issue_id": "def456",
           "issue_identifier": "MT-650",
+          "title": "Recover the retry lane",
           "issue_url": "https://tracker.example/issues/MT-650",
+          "stage": "retrying",
           "attempt": 3,
           "due_at": "2026-02-24T20:16:00Z",
           "error": "no available orchestrator slots"
@@ -1568,7 +1572,9 @@ Minimum endpoints:
     {
       "issue_identifier": "MT-649",
       "issue_id": "abc123",
+      "title": "Keep the operator HUD truthful",
       "status": "running",
+      "stage": "implementing",
       "workspace": {
         "path": "/tmp/symphony_workspaces/MT-649"
       },
@@ -1611,6 +1617,11 @@ Minimum endpoints:
       "tracked": {}
     }
     ```
+
+  - Work entries SHOULD preserve the tracker's title and expose a lifecycle `stage`. The baseline
+    stages are `bootstrapping` for a running entry before a session is established, `implementing`
+    once it has a session, `retrying` while a retry timer owns it, and `blocked` while it is in the
+    blocked ledger. Missing titles remain `null`; consumers must not invent one from another field.
 
   - If the issue is unknown to the current in-memory state, return `404` with an error response (for
     example `{\"error\":{\"code\":\"issue_not_found\",\"message\":\"...\"}}`).

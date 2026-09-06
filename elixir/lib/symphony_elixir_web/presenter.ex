@@ -67,7 +67,9 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_identifier: issue_identifier,
       issue_id: issue_id_from_entries(running, retry, blocked),
+      title: issue_title_from_entries(running, retry, blocked),
       status: issue_status(running, retry, blocked),
+      stage: issue_stage(running, retry, blocked),
       workspace: %{
         path: workspace_path(issue_identifier, running, retry, blocked),
         host: workspace_host(running, retry, blocked)
@@ -91,6 +93,9 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_id_from_entries(running, retry, blocked),
     do: (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id)
 
+  defp issue_title_from_entries(running, retry, blocked),
+    do: entry_title(running) || entry_title(retry) || entry_title(blocked)
+
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
@@ -99,12 +104,18 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
   defp issue_status(nil, nil, _blocked), do: "blocked"
 
+  defp issue_stage(running, _retry, _blocked) when not is_nil(running), do: running_stage(running)
+  defp issue_stage(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
+  defp issue_stage(nil, nil, _blocked), do: "blocked"
+
   defp running_entry_payload(entry) do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      title: entry_title(entry),
       issue_url: Map.get(entry, :issue_url),
       state: entry.state,
+      stage: running_stage(entry),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
@@ -125,7 +136,9 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      title: entry_title(entry),
       issue_url: Map.get(entry, :issue_url),
+      stage: "retrying",
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
       error: entry.error,
@@ -138,8 +151,10 @@ defmodule SymphonyElixirWeb.Presenter do
     payload = %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      title: entry_title(entry),
       issue_url: Map.get(entry, :issue_url),
       state: entry.state,
+      stage: "blocked",
       error: entry.error,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
@@ -163,6 +178,7 @@ defmodule SymphonyElixirWeb.Presenter do
       session_id: running.session_id,
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
+      stage: running_stage(running),
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
       last_message: summarize_message(running.last_codex_message),
@@ -178,6 +194,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_issue_payload(retry) do
     %{
       attempt: retry.attempt,
+      stage: "retrying",
       due_at: due_at_iso8601(retry.due_in_ms),
       error: retry.error,
       worker_host: Map.get(retry, :worker_host),
@@ -191,6 +208,7 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(blocked, :workspace_path),
       session_id: blocked.session_id,
       state: blocked.state,
+      stage: "blocked",
       error: blocked.error,
       blocked_at: iso8601(blocked.blocked_at),
       last_event: blocked.last_codex_event,
@@ -227,6 +245,13 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
+
+  defp entry_title(nil), do: nil
+  defp entry_title(entry), do: Map.get(entry, :title)
+
+  defp running_stage(entry) do
+    if is_binary(Map.get(entry, :session_id)), do: "implementing", else: "bootstrapping"
+  end
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()
