@@ -11,6 +11,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @provider_capacity_schema "symphony-provider-capacity/v1"
+  @provider_capacity_receipt ~r/\Acodex-rotate: CAPACITY_UNAVAILABLE schema=symphony-provider-capacity\/v1 class=provider-capacity retryable=true reason=(?<reason>[a-z0-9_-]+) retryAt=(?<retry_at>unknown|[0-9]+) waitSeconds=(?<wait_seconds>unknown|[0-9]+)\z/
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -913,23 +915,33 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
+    with_timeout_response(port, request_id, timeout_ms, pending_line, nil)
+  end
+
+  defp with_timeout_response(port, request_id, timeout_ms, pending_line, capacity_evidence) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+        handle_response(port, request_id, complete_line, timeout_ms, capacity_evidence)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        with_timeout_response(
+          port,
+          request_id,
+          timeout_ms,
+          pending_line <> to_string(chunk),
+          capacity_evidence
+        )
 
       {^port, {:exit_status, status}} ->
-        {:error, {:port_exit, status}}
+        provider_capacity_exit_response(status, capacity_evidence)
     after
       timeout_ms ->
         {:error, :response_timeout}
     end
   end
 
-  defp handle_response(port, request_id, data, timeout_ms) do
+  defp handle_response(port, request_id, data, timeout_ms, capacity_evidence) do
     payload = to_string(data)
 
     case Jason.decode(payload) do
@@ -944,13 +956,52 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        with_timeout_response(port, request_id, timeout_ms, "", capacity_evidence)
 
       {:error, _} ->
-        log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        case provider_capacity_receipt(payload) do
+          {:ok, evidence} ->
+            with_timeout_response(port, request_id, timeout_ms, "", evidence)
+
+          :error ->
+            log_non_json_stream_line(payload, "response stream")
+            with_timeout_response(port, request_id, timeout_ms, "", capacity_evidence)
+        end
     end
   end
+
+  defp provider_capacity_receipt(payload) when is_binary(payload) do
+    with %{"reason" => reason, "retry_at" => retry_at, "wait_seconds" => wait_seconds} <-
+           Regex.named_captures(@provider_capacity_receipt, payload),
+         {:ok, parsed_retry_at} <- provider_capacity_integer(retry_at),
+         {:ok, parsed_wait_seconds} <- provider_capacity_integer(wait_seconds) do
+      {:ok,
+       %{
+         schema: @provider_capacity_schema,
+         class: :provider_capacity,
+         retryable: true,
+         reason: reason,
+         retry_at: parsed_retry_at,
+         wait_seconds: parsed_wait_seconds
+       }}
+    else
+      _ -> :error
+    end
+  end
+
+  defp provider_capacity_integer("unknown"), do: {:ok, nil}
+
+  defp provider_capacity_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed >= 0 -> {:ok, parsed}
+      _ -> :error
+    end
+  end
+
+  defp provider_capacity_exit_response(75, evidence) when is_map(evidence),
+    do: {:error, {:provider_capacity_unavailable, evidence}}
+
+  defp provider_capacity_exit_response(status, _evidence), do: {:error, {:port_exit, status}}
 
   defp log_non_json_stream_line(data, stream_label) do
     text =

@@ -811,11 +811,16 @@ Retry handling behavior:
 3. If found in a terminal state, clean its workspace and release claim.
 4. If found and still active and routable:
    - Dispatch if slots are available.
-   - Otherwise requeue with error `no available orchestrator slots`.
+   - Otherwise keep the existing retry queued without advancing its execution-attempt count or
+     replacing the failure that caused the retry.
 5. If found but no longer active or routable, release claim without dispatch.
 
 Note:
 
+- A coding-agent launcher MAY emit a typed pre-session provider-capacity receipt. When the receipt
+  supplies a valid finite retry window, the orchestrator releases the candidate claim, creates no
+  execution retry, and pauses new admission globally until that window expires. Reconciliation
+  remains active, and a malformed or untyped launcher exit stays on the ordinary worker-failure path.
 - Terminal-state workspace cleanup is handled by startup cleanup, active-run reconciliation, and
   retry refreshes that observe a terminal transition.
 - ID refresh avoids treating a terminal, non-active, or newly unroutable issue as merely absent.
