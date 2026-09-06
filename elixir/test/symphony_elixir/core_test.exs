@@ -1372,6 +1372,62 @@ defmodule SymphonyElixir.CoreTest do
       )
 
     assert Orchestrator.should_dispatch_issue_for_test(List.first(candidates), expired_capacity_state)
+
+    unknown_issue_id = "issue-provider-capacity-invalid-state"
+    unknown_ref = make_ref()
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: %{
+            unknown_issue_id => %{
+              pid: self(),
+              ref: unknown_ref,
+              identifier: "MT-PROVIDER-CAPACITY-INVALID",
+              issue: %Issue{
+                id: unknown_issue_id,
+                identifier: "MT-PROVIDER-CAPACITY-INVALID",
+                state: "In Progress"
+              },
+              session_id: nil,
+              turn_count: 0,
+              started_at: DateTime.utc_now()
+            }
+          },
+          claimed: MapSet.new([unknown_issue_id]),
+          retry_attempts: %{},
+          provider_capacity: nil
+      }
+    end)
+
+    invalid_state_evidence = %{
+      schema: "symphony-provider-capacity/v1",
+      class: :provider_capacity,
+      retryable: true,
+      reason: "account_state_invalid",
+      retry_at: nil,
+      wait_seconds: nil
+    }
+
+    invalid_state_error = %AgentRunner.Error{
+      message: "Agent run failed before session start",
+      reason: {:provider_capacity_unavailable, invalid_state_evidence}
+    }
+
+    send(
+      pid,
+      {:DOWN, unknown_ref, :process, self(), {invalid_state_error, [{AgentRunner, :run, 3, []}]}}
+    )
+
+    invalid_state =
+      eventually_value(fn ->
+        state = :sys.get_state(pid)
+        if state.provider_capacity && state.provider_capacity.reason == "account_state_invalid", do: state
+      end)
+
+    assert invalid_state.retry_attempts == %{}
+    refute MapSet.member?(invalid_state.claimed, unknown_issue_id)
+    assert_due_in_range(invalid_state.provider_capacity.retry_until_ms, 299_000, 300_000)
   end
 
   test "existing retry timers wait through provider cooldown and recover after expiry" do
@@ -1440,6 +1496,7 @@ defmodule SymphonyElixir.CoreTest do
           next_poll_due_at_ms: nil,
           claimed: MapSet.new(Enum.map(issues, & &1.id)),
           retry_attempts: retry_attempts,
+          tracker_retry_until_ms: now_ms + 1_000,
           provider_capacity: %{
             schema: "symphony-provider-capacity/v1",
             class: :provider_capacity,
@@ -1473,8 +1530,20 @@ defmodule SymphonyElixir.CoreTest do
     assert Task.Supervisor.children(task_supervisor) == []
     refute File.exists?(launch_marker)
 
+    send(pid, :run_poll_cycle)
+
+    scheduled_state =
+      eventually_value(fn ->
+        state = :sys.get_state(pid)
+        if is_integer(state.next_poll_due_at_ms), do: state
+      end)
+
+    assert_due_in_range(scheduled_state.next_poll_due_at_ms, 4_000, 5_000)
+
     :sys.replace_state(pid, fn state ->
-      put_in(state.provider_capacity.retry_until_ms, System.monotonic_time(:millisecond) - 1)
+      state
+      |> put_in([Access.key(:provider_capacity), Access.key(:retry_until_ms)], System.monotonic_time(:millisecond) - 1)
+      |> Map.put(:tracker_retry_until_ms, nil)
     end)
 
     resumed_token = deferred_state.retry_attempts[List.first(issues).id].retry_token
@@ -1861,6 +1930,28 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(second_wait.blocked, issue_id)
     Process.cancel_timer(second_retry.timer_ref)
+
+    provider_wait = %{
+      second_wait
+      | running: %{},
+        provider_capacity: %{
+          retry_until_ms: System.monotonic_time(:millisecond) + 60_000
+        }
+    }
+
+    retry_during_provider_wait =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, provider_wait, issue_id, 1, %{
+        identifier: issue.identifier,
+        error: "agent exited after execution started"
+      })
+
+    assert %{
+             attempt: 1,
+             error: "agent exited after execution started"
+           } = provider_retry = retry_during_provider_wait.retry_attempts[issue_id]
+
+    assert retry_during_provider_wait.running == %{}
+    Process.cancel_timer(provider_retry.timer_ref)
   end
 
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do

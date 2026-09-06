@@ -91,6 +91,26 @@ defmodule SymphonyElixir.AppServerTest do
              }}} = run_pre_session_launcher(@provider_capacity_line, 75)
   end
 
+  test "app server preserves unknown provider-capacity windows before exit 75" do
+    capacity_line =
+      "codex-rotate: CAPACITY_UNAVAILABLE schema=symphony-provider-capacity/v1 class=provider-capacity retryable=true reason=account_state_invalid retryAt=unknown waitSeconds=unknown"
+
+    assert {:error,
+            {:provider_capacity_unavailable,
+             %{
+               reason: "account_state_invalid",
+               retry_at: nil,
+               wait_seconds: nil
+             }}} = run_pre_session_launcher(capacity_line, 75)
+  end
+
+  test "provider-capacity evidence survives unrelated JSON before exit 75" do
+    unrelated_message = Jason.encode!(%{"method" => "server/notice", "params" => %{}})
+
+    assert {:error, {:provider_capacity_unavailable, %{reason: "account_cooldown"}}} =
+             run_pre_session_launcher(@provider_capacity_line <> "\n" <> unrelated_message, 75)
+  end
+
   test "provider-capacity evidence requires the exact full launcher line" do
     malformed_lines = [
       "prefix #{@provider_capacity_line}",
