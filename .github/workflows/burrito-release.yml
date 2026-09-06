@@ -2,16 +2,115 @@ name: burrito-release
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
+    inputs:
+      source_sha:
+        description: Exact current main SHA to build and publish
+        required: true
+        type: string
+      make_all_run_id:
+        description: Successful make-all workflow run ID for source_sha
+        required: true
+        type: string
+      make_all_run_attempt:
+        description: Exact attempt number of make_all_run_id
+        required: true
+        type: string
+
+concurrency:
+  group: burrito-release-${{ inputs.source_sha }}
+  cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
+  provenance:
+    name: verify-source-provenance
+    if: github.repository == 'JovieInc/symphony' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      already_published: ${{ steps.existing.outputs.already_published }}
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+    steps:
+      - name: Checkout release verifier from main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate dispatch identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+          MAKE_ALL_RUN_ATTEMPT: ${{ inputs.make_all_run_attempt }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MAKE_ALL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$MAKE_ALL_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+
+      - name: Fetch exact main and make-all receipts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" > "$RUNNER_TEMP/main-ref.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/make-all.yml" > "$RUNNER_TEMP/workflow.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$MAKE_ALL_RUN_ID" > "$RUNNER_TEMP/run.json"
+
+      - name: Bind source to successful make-all run and attempt
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+          MAKE_ALL_RUN_ATTEMPT: ${{ inputs.make_all_run_attempt }}
+        run: |
+          python3 .github/scripts/release_provenance.py verify-ci \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$MAKE_ALL_RUN_ID" \
+            --run-attempt "$MAKE_ALL_RUN_ATTEMPT" \
+            --main-ref-json "$RUNNER_TEMP/main-ref.json" \
+            --workflow-json "$RUNNER_TEMP/workflow.json" \
+            --run-json "$RUNNER_TEMP/run.json" \
+            --output "$RUNNER_TEMP/verified-ci.json"
+
+      - name: Set immutable release identity
+        id: identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: echo "release_tag=symphony-build-$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Reuse only an exact verified release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+          MAKE_ALL_RUN_ATTEMPT: ${{ inputs.make_all_run_attempt }}
+          RELEASE_TAG: ${{ steps.identity.outputs.release_tag }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          test "$tag_type" = "commit"
+          test "$tag_sha" = "$SOURCE_SHA"
+          mkdir "$RUNNER_TEMP/existing-release"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/existing-release"
+          python3 .github/scripts/release_provenance.py verify-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$MAKE_ALL_RUN_ID" \
+            --run-attempt "$MAKE_ALL_RUN_ATTEMPT" \
+            --release-dir "$RUNNER_TEMP/existing-release"
+          echo "already_published=true" >> "$GITHUB_OUTPUT"
+
   build:
     name: build-${{ matrix.target }}
+    needs: provenance
+    if: needs.provenance.outputs.already_published != 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -20,69 +119,69 @@ jobs:
     defaults:
       run:
         working-directory: elixir
-
     steps:
-      - name: Checkout
+      - name: Checkout exact tested source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify checkout identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - name: Set up mise tools
         uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
           install: true
           cache: true
           working_directory: elixir
-
       - name: Install Zig
         run: mise install zig@0.15.2
-
       - name: Install xz
         run: sudo apt-get update && sudo apt-get install -y xz-utils
-
       - name: Install Mix dependencies
         run: |
           mix local.hex --force
           mix local.rebar --force
           mix deps.get
-
-      - name: Verify release tag matches project version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          project_version="$(sed -nE 's/^[[:space:]]*version: "([^"]+)",$/\1/p' mix.exs | head -n 1)"
-          expected_tag="v$project_version"
-
-          if test -z "$project_version" || test "$GITHUB_REF_NAME" != "$expected_tag"; then
-            echo "Release tag $GITHUB_REF_NAME does not match mix.exs version $project_version."
-            exit 1
-          fi
-
       - name: Build Burrito executable
         run: BURRITO_TARGET=${{ matrix.target }} MIX_ENV=prod mise exec zig@0.15.2 -- mix release symphony --overwrite
-
-      - name: Stage release assets
+      - name: Stage binary, digest, and provenance
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+          MAKE_ALL_RUN_ATTEMPT: ${{ inputs.make_all_run_attempt }}
+          TARGET: ${{ matrix.target }}
         run: |
-          if test "$GITHUB_REF_TYPE" = "tag"; then
-            version="$GITHUB_REF_NAME"
-          else
-            version="${GITHUB_SHA::7}"
-          fi
-
-          artifact="symphony-${version}-${{ matrix.target }}"
+          artifact="symphony-$SOURCE_SHA-$TARGET"
           mkdir -p dist
-          cp "burrito_out/symphony_${{ matrix.target }}" "dist/$artifact"
+          cp "burrito_out/symphony_$TARGET" "dist/$artifact"
           cd dist
-
           sha256sum "$artifact" > "$artifact.sha256"
-
-      - name: Upload release assets
+          artifact_sha256="$(cut -d ' ' -f 1 "$artifact.sha256")"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg target "$TARGET" \
+            --arg artifact "$artifact" \
+            --arg sha256 "$artifact_sha256" \
+            --arg workflow_path ".github/workflows/make-all.yml" \
+            --argjson run_id "$MAKE_ALL_RUN_ID" \
+            --argjson run_attempt "$MAKE_ALL_RUN_ATTEMPT" \
+            '{repository: $repository, source_sha: $source_sha, target: $target, artifact: $artifact, sha256: $sha256, make_all: {workflow_path: $workflow_path, run_id: $run_id, run_attempt: $run_attempt, event: "push", conclusion: "success"}}' \
+            > "$artifact.provenance.json"
+      - name: Upload immutable build output
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ matrix.target }}
+          name: build-${{ matrix.target }}
           path: elixir/dist/*
           if-no-files-found: error
+          retention-days: 30
 
   smoke:
     name: smoke-${{ matrix.target }}
-    needs: build
+    needs: [provenance, build]
+    if: needs.provenance.outputs.already_published != 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -96,51 +195,144 @@ jobs:
             runner: macos-15-intel
           - target: macos_arm64
             runner: macos-14
-
     steps:
-      - name: Download release assets
+      - name: Download exact build output
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ matrix.target }}
+          name: build-${{ matrix.target }}
           path: dist
-
-      - name: Smoke test executable
+      - name: Verify digest and smoke test executable
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+          MAKE_ALL_RUN_ATTEMPT: ${{ inputs.make_all_run_attempt }}
+          TARGET: ${{ matrix.target }}
         run: |
-          artifact="$(find dist -type f ! -name '*.sha256' -print -quit)"
-          test -n "$artifact"
+          artifact="symphony-$SOURCE_SHA-$TARGET"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check "$artifact.sha256"
+          else
+            shasum -a 256 --check "$artifact.sha256"
+          fi
+          artifact_sha256="$(cut -d ' ' -f 1 "$artifact.sha256")"
+          test "$(jq -r '.sha256' "$artifact.provenance.json")" = "$artifact_sha256"
           chmod +x "$artifact"
-
           set +e
-          output="$(SYMPHONY_INSTALL_DIR="$RUNNER_TEMP/symphony-install" "$artifact" 2>&1)"
+          output="$(SYMPHONY_INSTALL_DIR="$RUNNER_TEMP/symphony-install" "./$artifact" 2>&1)"
           status=$?
           set -e
-
           test "$status" -eq 1
           grep -F "This Symphony implementation is a low key engineering preview." <<<"$output"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg target "$TARGET" \
+            --arg artifact "$artifact" \
+            --arg sha256 "$artifact_sha256" \
+            --argjson make_all_run_id "$MAKE_ALL_RUN_ID" \
+            --argjson make_all_run_attempt "$MAKE_ALL_RUN_ATTEMPT" \
+            --argjson observed_exit_status "$status" \
+            '{repository: $repository, source_sha: $source_sha, target: $target, artifact: $artifact, sha256: $sha256, make_all_run_id: $make_all_run_id, make_all_run_attempt: $make_all_run_attempt, result: "passed", observed_exit_status: $observed_exit_status}' \
+            > "$artifact.smoke.json"
+      - name: Upload smoke receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smoke-${{ matrix.target }}
+          path: dist/*.smoke.json
+          if-no-files-found: error
+          retention-days: 30
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, smoke]
+    name: publish-immutable-release
+    needs: [provenance, build, smoke]
+    if: needs.provenance.outputs.already_published != 'true'
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
-
     steps:
-      - name: Checkout
+      - name: Checkout exact tested source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Download release assets
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Revalidate exact CI and current main before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+          MAKE_ALL_RUN_ATTEMPT: ${{ inputs.make_all_run_attempt }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" > "$RUNNER_TEMP/main-ref.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/make-all.yml" > "$RUNNER_TEMP/workflow.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$MAKE_ALL_RUN_ID" > "$RUNNER_TEMP/run.json"
+          python3 .github/scripts/release_provenance.py verify-ci \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$MAKE_ALL_RUN_ID" \
+            --run-attempt "$MAKE_ALL_RUN_ATTEMPT" \
+            --main-ref-json "$RUNNER_TEMP/main-ref.json" \
+            --workflow-json "$RUNNER_TEMP/workflow.json" \
+            --run-json "$RUNNER_TEMP/run.json" \
+            --output "$RUNNER_TEMP/reverified-ci.json"
+      - name: Download build and smoke receipts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
-
-      - name: Create or update GitHub release
+      - name: Assemble and verify release manifest
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+          MAKE_ALL_RUN_ATTEMPT: ${{ inputs.make_all_run_attempt }}
+        run: |
+          python3 .github/scripts/release_provenance.py assemble \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$MAKE_ALL_RUN_ID" \
+            --run-attempt "$MAKE_ALL_RUN_ATTEMPT" \
+            --input-dir dist \
+            --output-dir release
+          python3 .github/scripts/release_provenance.py verify-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$MAKE_ALL_RUN_ID" \
+            --run-attempt "$MAKE_ALL_RUN_ATTEMPT" \
+            --release-dir release
+      - name: Create immutable SHA tag
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ needs.provenance.outputs.release_tag }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*/* --clobber
+          if tag_json="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" 2>/dev/null)"; then
+            test "$(jq -r '.object.type' <<<"$tag_json")" = "commit"
+            test "$(jq -r '.object.sha' <<<"$tag_json")" = "$SOURCE_SHA"
           else
-            gh release create "$TAG" dist/*/* --verify-tag --generate-notes
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" \
+              -f sha="$SOURCE_SHA" >/dev/null
           fi
+      - name: Publish without replacing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MAKE_ALL_RUN_ID: ${{ inputs.make_all_run_id }}
+          MAKE_ALL_RUN_ATTEMPT: ${{ inputs.make_all_run_attempt }}
+          RELEASE_TAG: ${{ needs.provenance.outputs.release_tag }}
+        run: |
+          test -z "$(gh release view "$RELEASE_TAG" --json id --jq '.id' 2>/dev/null || true)"
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Immutable Symphony build from exact main commit $SOURCE_SHA."
+            echo
+            echo "Validated by make-all run $MAKE_ALL_RUN_ID, attempt $MAKE_ALL_RUN_ATTEMPT."
+            echo
+            echo "The attached manifest binds every binary, SHA-256 digest, provenance record, and platform smoke receipt."
+          } > "$notes"
+          gh release create "$RELEASE_TAG" release/* \
+            --verify-tag \
+            --title "Symphony build ${SOURCE_SHA::12}" \
+            --notes-file "$notes" \
+            --latest=false
