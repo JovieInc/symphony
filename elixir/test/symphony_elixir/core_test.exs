@@ -1078,6 +1078,9 @@ defmodule SymphonyElixir.CoreTest do
       identifier: "MT-559",
       retry_attempt: 2,
       issue: %Issue{id: issue_id, identifier: "MT-559", state: "In Progress"},
+      session_id: "thread-crash-turn-crash",
+      last_codex_event: :session_started,
+      turn_count: 1,
       started_at: DateTime.utc_now()
     }
 
@@ -1123,6 +1126,9 @@ defmodule SymphonyElixir.CoreTest do
       ref: ref,
       identifier: "MT-560",
       issue: %Issue{id: issue_id, identifier: "MT-560", state: "In Progress"},
+      session_id: "thread-initial-turn-initial",
+      last_codex_event: :session_started,
+      turn_count: 1,
       started_at: DateTime.utc_now()
     }
 
@@ -1263,6 +1269,220 @@ defmodule SymphonyElixir.CoreTest do
     assert error =~ "75"
   end
 
+  test "typed pre-session provider capacity pauses admission without walking the backlog" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_concurrent_agents: 1,
+      max_retry_backoff_ms: 300_000
+    )
+
+    issue_id = "issue-provider-capacity"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ProviderCapacityOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-PROVIDER-CAPACITY",
+      issue: %Issue{id: issue_id, identifier: "MT-PROVIDER-CAPACITY", state: "In Progress"},
+      session_id: nil,
+      turn_count: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:max_concurrent_agents, 1)
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    capacity_evidence = %{
+      schema: "symphony-provider-capacity/v1",
+      class: :provider_capacity,
+      retryable: true,
+      reason: "account_cooldown",
+      retry_at: 1_788_654_000,
+      wait_seconds: 300
+    }
+
+    agent_error = %AgentRunner.Error{
+      message: "Agent run failed before session start",
+      reason: {:provider_capacity_unavailable, capacity_evidence}
+    }
+
+    send(pid, {:DOWN, ref, :process, self(), {agent_error, [{AgentRunner, :run, 3, []}]}})
+    Process.sleep(50)
+    capacity_state = :sys.get_state(pid)
+
+    assert capacity_state.running == %{}
+    assert capacity_state.retry_attempts == %{}
+    refute MapSet.member?(capacity_state.claimed, issue_id)
+    assert capacity_state.provider_capacity.reason == "account_cooldown"
+    assert capacity_state.provider_capacity.retry_at == 1_788_654_000
+    assert_due_in_range(capacity_state.provider_capacity.retry_until_ms, 299_000, 300_000)
+
+    assert %{
+             provider_capacity: %{
+               schema: "symphony-provider-capacity/v1",
+               class: :provider_capacity,
+               reason: "account_cooldown",
+               retry_at: 1_788_654_000,
+               retry_in_ms: retry_in_ms
+             }
+           } = Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    assert retry_in_ms >= 299_000
+    assert retry_in_ms <= 300_000
+
+    candidates =
+      for index <- 1..5 do
+        %Issue{
+          id: "capacity-candidate-#{index}",
+          identifier: "MT-CAPACITY-#{index}",
+          title: "Capacity candidate #{index}",
+          state: "In Progress",
+          dispatchable: true
+        }
+      end
+
+    issue_fetcher = fn _issue_ids -> flunk("capacity-blocked candidates must not be revalidated") end
+    first_poll = Orchestrator.choose_issues_for_test(candidates, capacity_state, issue_fetcher)
+    repeated_poll = Orchestrator.choose_issues_for_test(candidates, first_poll, issue_fetcher)
+
+    assert first_poll.running == %{}
+    assert first_poll.claimed == MapSet.new()
+    assert first_poll.retry_attempts == %{}
+    assert repeated_poll.running == %{}
+    assert repeated_poll.claimed == MapSet.new()
+    assert repeated_poll.retry_attempts == %{}
+
+    expired_capacity_state =
+      put_in(
+        repeated_poll.provider_capacity.retry_until_ms,
+        System.monotonic_time(:millisecond) - 1
+      )
+
+    assert Orchestrator.should_dispatch_issue_for_test(List.first(candidates), expired_capacity_state)
+  end
+
+  test "existing retry timers wait through provider cooldown and recover after expiry" do
+    issue_suffix = System.unique_integer([:positive])
+    test_root = Path.join(System.tmp_dir!(), "symphony-provider-retry-cooldown-#{issue_suffix}")
+    launch_marker = Path.join(test_root, "launched")
+    orchestrator_name = Module.concat(__MODULE__, "ProviderRetryCooldown#{issue_suffix}")
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    issues =
+      for index <- 1..3 do
+        %Issue{
+          id: "provider-retry-#{issue_suffix}-#{index}",
+          identifier: "MT-PROVIDER-RETRY-#{issue_suffix}-#{index}",
+          title: "Wait for shared provider capacity #{index}",
+          state: "In Progress",
+          dispatchable: true
+        }
+      end
+
+    on_exit(fn ->
+      if pid = Process.whereis(orchestrator_name), do: GenServer.stop(pid)
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      poll_interval_ms: 60_000,
+      max_concurrent_agents: 1,
+      hook_after_create: "mkdir -p .git",
+      hook_before_run: "printf launched > #{launch_marker}; exit 1"
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+
+    {:ok, pid} =
+      Orchestrator.start_link(name: orchestrator_name, task_supervisor: task_supervisor)
+
+    Process.sleep(50)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
+
+    retry_tokens = Map.new(issues, &{&1.id, make_ref()})
+    now_ms = System.monotonic_time(:millisecond)
+
+    :sys.replace_state(pid, fn state ->
+      if is_reference(state.tick_timer_ref), do: Process.cancel_timer(state.tick_timer_ref)
+
+      retry_attempts =
+        Map.new(issues, fn issue ->
+          {issue.id,
+           %{
+             attempt: 3,
+             retry_token: retry_tokens[issue.id],
+             identifier: issue.identifier,
+             error: "real execution failed"
+           }}
+        end)
+
+      %{
+        state
+        | tick_timer_ref: nil,
+          tick_token: nil,
+          next_poll_due_at_ms: nil,
+          claimed: MapSet.new(Enum.map(issues, & &1.id)),
+          retry_attempts: retry_attempts,
+          provider_capacity: %{
+            schema: "symphony-provider-capacity/v1",
+            class: :provider_capacity,
+            retryable: true,
+            reason: "account_cooldown",
+            retry_at: 1_788_654_000,
+            wait_seconds: 5,
+            observed_at: DateTime.utc_now(),
+            retry_until_ms: now_ms + 5_000
+          }
+      }
+    end)
+
+    Enum.each(issues, fn issue ->
+      send(pid, {:retry_issue, issue.id, retry_tokens[issue.id]})
+    end)
+
+    deferred_state =
+      eventually_value(fn ->
+        state = :sys.get_state(pid)
+
+        if Enum.all?(issues, fn issue ->
+             match?(%{attempt: 3, error: "real execution failed"}, state.retry_attempts[issue.id]) and
+               state.retry_attempts[issue.id].retry_token != retry_tokens[issue.id]
+           end) do
+          state
+        end
+      end)
+
+    assert deferred_state.running == %{}
+    assert Task.Supervisor.children(task_supervisor) == []
+    refute File.exists?(launch_marker)
+
+    :sys.replace_state(pid, fn state ->
+      put_in(state.provider_capacity.retry_until_ms, System.monotonic_time(:millisecond) - 1)
+    end)
+
+    resumed_token = deferred_state.retry_attempts[List.first(issues).id].retry_token
+    send(pid, {:retry_issue, List.first(issues).id, resumed_token})
+
+    assert eventually_value(fn -> if File.exists?(launch_marker), do: true end)
+  end
+
   test "rate-limited worker exit retains the provider retry window" do
     issue_id = "issue-rate-limited-agent"
     ref = make_ref()
@@ -1367,22 +1587,35 @@ defmodule SymphonyElixir.CoreTest do
       identifier: "MT-DEDUP-#{issue_suffix}",
       title: "Dispatch this issue once",
       state: "In Progress",
+      priority: 1,
       labels: [],
       dispatchable: true
     }
 
+    overflow_issues =
+      for index <- 1..4 do
+        %Issue{
+          id: "issue-overflow-#{issue_suffix}-#{index}",
+          identifier: "MT-OVERFLOW-#{issue_suffix}-#{index}",
+          title: "Leave overflow candidate #{index} undispatched",
+          state: "In Progress",
+          priority: 4,
+          labels: [],
+          dispatchable: true
+        }
+      end
+
+    candidates = [issue, issue | overflow_issues]
+
     {:ok, request_counter} = Agent.start_link(fn -> 0 end)
     {:ok, task_supervisor} = Task.Supervisor.start_link()
 
-    on_exit(fn ->
-      if Process.alive?(task_supervisor), do: Supervisor.stop(task_supervisor)
-      File.rm_rf(test_root)
-    end)
+    on_exit(fn -> File.rm_rf(test_root) end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       workspace_root: test_root,
-      max_concurrent_agents: 2,
+      max_concurrent_agents: 1,
       hook_after_create: "mkdir -p .git",
       hook_before_run: "exit 1"
     )
@@ -1394,7 +1627,7 @@ defmodule SymphonyElixir.CoreTest do
     end
 
     initial_state = %Orchestrator.State{
-      max_concurrent_agents: 2,
+      max_concurrent_agents: 1,
       task_supervisor: task_supervisor,
       running: %{},
       claimed: MapSet.new(),
@@ -1404,19 +1637,21 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     first_state =
-      Orchestrator.choose_issues_for_test([issue, issue], initial_state, issue_fetcher)
+      Orchestrator.choose_issues_for_test(candidates, initial_state, issue_fetcher)
 
     assert Agent.get(request_counter, & &1) == 1
     assert MapSet.equal?(first_state.claimed, MapSet.new([issue.id]))
     assert %{pid: worker_pid} = first_state.running[issue.id]
     assert is_pid(worker_pid)
+    assert first_state.retry_attempts == %{}
 
     repeated_state =
-      Orchestrator.choose_issues_for_test([issue, issue], first_state, issue_fetcher)
+      Orchestrator.choose_issues_for_test(candidates, first_state, issue_fetcher)
 
     assert Agent.get(request_counter, & &1) == 1
     assert repeated_state.running == first_state.running
     assert repeated_state.claimed == first_state.claimed
+    assert repeated_state.retry_attempts == %{}
   end
 
   test "agent tracker refreshes share the orchestrator budget cooldown" do
@@ -1577,29 +1812,55 @@ defmodule SymphonyElixir.CoreTest do
   test "capacity waits remain queued instead of consuming the failure retry budget" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
+      max_concurrent_agents: 1,
       max_retry_attempts: 2
     )
 
     issue_id = "issue-capacity-wait"
 
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CAPACITY",
+      title: "Wait for the occupied slot",
+      state: "In Progress",
+      dispatchable: true
+    }
+
     state = %Orchestrator.State{
-      running: %{},
-      claimed: MapSet.new([issue_id]),
+      max_concurrent_agents: 1,
+      running: %{"busy-issue" => %{issue: %Issue{id: "busy-issue", state: "In Progress"}}},
+      claimed: MapSet.new([issue_id, "busy-issue"]),
       blocked: %{},
       retry_attempts: %{},
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    updated_state =
-      Orchestrator.schedule_issue_retry_for_test(state, issue_id, 3, %{
-        identifier: "MT-CAPACITY",
-        error: "no available orchestrator slots",
-        retry_exhaustible: false
+    first_wait =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
+        identifier: issue.identifier,
+        error: "agent exited after execution started"
       })
 
-    refute Map.has_key?(updated_state.blocked, issue_id)
-    assert %{attempt: 3} = retry = updated_state.retry_attempts[issue_id]
-    Process.cancel_timer(retry.timer_ref)
+    assert %{
+             attempt: 1,
+             error: "agent exited after execution started"
+           } = first_retry = first_wait.retry_attempts[issue_id]
+
+    Process.cancel_timer(first_retry.timer_ref)
+
+    second_wait =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, first_wait, issue_id, 1, %{
+        identifier: issue.identifier,
+        error: "agent exited after execution started"
+      })
+
+    assert %{
+             attempt: 1,
+             error: "agent exited after execution started"
+           } = second_retry = second_wait.retry_attempts[issue_id]
+
+    refute Map.has_key?(second_wait.blocked, issue_id)
+    Process.cancel_timer(second_retry.timer_ref)
   end
 
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do

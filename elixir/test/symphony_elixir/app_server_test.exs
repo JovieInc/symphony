@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  @provider_capacity_line "codex-rotate: CAPACITY_UNAVAILABLE schema=symphony-provider-capacity/v1 class=provider-capacity retryable=true reason=account_cooldown retryAt=1788654000 waitSeconds=300"
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -74,6 +76,44 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "app server preserves typed provider-capacity evidence before exit 75" do
+    assert {:error,
+            {:provider_capacity_unavailable,
+             %{
+               schema: "symphony-provider-capacity/v1",
+               class: :provider_capacity,
+               retryable: true,
+               reason: "account_cooldown",
+               retry_at: 1_788_654_000,
+               wait_seconds: 300
+             }}} = run_pre_session_launcher(@provider_capacity_line, 75)
+  end
+
+  test "provider-capacity evidence requires the exact full launcher line" do
+    malformed_lines = [
+      "prefix #{@provider_capacity_line}",
+      @provider_capacity_line <> " extra=unexpected",
+      String.replace(@provider_capacity_line, " waitSeconds=300", ""),
+      @provider_capacity_line <> " reason=duplicate",
+      String.replace(@provider_capacity_line, "retryAt=1788654000", "retryAt=soon")
+    ]
+
+    for line <- malformed_lines do
+      assert {:error, {:port_exit, 75}} = run_pre_session_launcher(line, 75)
+    end
+  end
+
+  test "provider-capacity evidence only classifies a subsequent exit 75" do
+    for status <- [0, 70] do
+      assert {:error, {:port_exit, ^status}} = run_pre_session_launcher(@provider_capacity_line, status)
+    end
+  end
+
+  test "ordinary launcher output followed by exit 75 remains an ordinary failure" do
+    assert {:error, {:port_exit, 75}} =
+             run_pre_session_launcher("codex-rotate: provider unavailable", 75)
   end
 
   test "completed protocol frames with failed turn status remain failures" do
@@ -1702,6 +1742,45 @@ defmodule SymphonyElixir.AppServerTest do
                  false
                end
              end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp run_pre_session_launcher(line, status) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-provider-capacity-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CAPACITY")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(Path.join(workspace, ".git"))
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      printf '%s\n' '#{line}' >&2
+      exit #{status}
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-provider-capacity",
+        identifier: "MT-CAPACITY",
+        title: "Preserve provider capacity",
+        state: "In Progress"
+      }
+
+      AppServer.run(workspace, "wait for capacity", issue)
     after
       File.rm_rf(test_root)
     end

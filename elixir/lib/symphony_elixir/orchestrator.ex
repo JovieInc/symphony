@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @max_provider_capacity_wait_ms 86_400_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -34,6 +35,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       :tracker_retry_until_ms,
+      :provider_capacity,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -227,6 +229,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
     cond do
+      provider_capacity_before_session?(reason, running_entry) ->
+        defer_for_provider_capacity(state, issue_id, running_entry, reason)
+
       input_required_blocker?(running_entry) ->
         block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
 
@@ -288,6 +293,61 @@ defmodule SymphonyElixir.Orchestrator do
     )
   end
 
+  defp provider_capacity_before_session?(reason, running_entry) do
+    is_nil(Map.get(running_entry, :session_id)) and
+      Map.get(running_entry, :turn_count, 0) == 0 and
+      match?({:ok, _evidence}, provider_capacity_evidence(reason))
+  end
+
+  defp provider_capacity_evidence({%AgentRunner.Error{reason: reason}, stacktrace})
+       when is_list(stacktrace),
+       do: provider_capacity_evidence(reason)
+
+  defp provider_capacity_evidence(%AgentRunner.Error{reason: reason}),
+    do: provider_capacity_evidence(reason)
+
+  defp provider_capacity_evidence({:provider_capacity_unavailable, %{retryable: true, reason: reason, retry_at: _retry_at} = evidence})
+       when is_binary(reason),
+       do: {:ok, evidence}
+
+  defp provider_capacity_evidence(_reason), do: :error
+
+  defp defer_for_provider_capacity(state, issue_id, running_entry, reason) do
+    {:ok, evidence} = provider_capacity_evidence(reason)
+    wait_ms = provider_capacity_wait_ms(evidence)
+    now_ms = System.monotonic_time(:millisecond)
+    retry_until_ms = max(provider_capacity_retry_until_ms(state) || now_ms, now_ms + wait_ms)
+    identifier = Map.get(running_entry, :identifier, issue_id)
+
+    Logger.warning(
+      "Provider capacity unavailable before session start for issue_id=#{issue_id} issue_identifier=#{identifier}; " <>
+        "releasing claim without execution retry and pausing admission for #{retry_until_ms - now_ms}ms " <>
+        "reason=#{evidence.reason} retry_at=#{inspect(evidence.retry_at)}"
+    )
+
+    state = %{
+      release_issue_claim(state, issue_id)
+      | provider_capacity:
+          evidence
+          |> Map.put(:observed_at, DateTime.utc_now())
+          |> Map.put(:retry_until_ms, retry_until_ms)
+    }
+
+    schedule_tick(state, retry_until_ms - now_ms)
+  end
+
+  defp provider_capacity_wait_ms(%{wait_seconds: wait_seconds})
+       when is_integer(wait_seconds) and wait_seconds >= 0 do
+    wait_seconds
+    |> Kernel.*(1_000)
+    |> max(1_000)
+    |> min(@max_provider_capacity_wait_ms)
+  end
+
+  defp provider_capacity_wait_ms(_evidence) do
+    min(Config.settings!().agent.max_retry_backoff_ms, @max_provider_capacity_wait_ms)
+  end
+
   defp maybe_dispatch(%State{} = state) do
     state =
       if tracker_available?(state) do
@@ -300,6 +360,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     with true <- tracker_available?(state),
          :ok <- Config.validate!(),
+         true <- provider_capacity_available?(state),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
@@ -883,6 +944,7 @@ defmodule SymphonyElixir.Orchestrator do
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
       tracker_available?(state) and
+      provider_capacity_available?(state) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -1193,6 +1255,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
+    case provider_capacity_remaining_ms(state) do
+      remaining_ms when is_integer(remaining_ms) and remaining_ms > 0 ->
+        {:noreply, defer_retry_for_provider_capacity(state, issue_id, attempt, metadata, remaining_ms)}
+
+      nil ->
+        handle_retry_issue_with_tracker(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp handle_retry_issue_with_tracker(state, issue_id, attempt, metadata) do
     case tracker_retry_remaining_ms(state) do
       remaining_ms when is_integer(remaining_ms) and remaining_ms > 0 ->
         {:noreply, defer_retry_for_tracker_cooldown(state, issue_id, attempt, metadata, remaining_ms)}
@@ -1292,6 +1364,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
+    case provider_capacity_remaining_ms(state) do
+      remaining_ms when is_integer(remaining_ms) and remaining_ms > 0 ->
+        {:noreply, defer_retry_for_provider_capacity(state, issue.id, attempt, metadata, remaining_ms)}
+
+      nil ->
+        handle_active_retry_after_provider_capacity(state, issue, attempt, metadata)
+    end
+  end
+
+  defp handle_active_retry_after_provider_capacity(state, issue, attempt, metadata) do
     case tracker_retry_remaining_ms(state) do
       remaining_ms when is_integer(remaining_ms) and remaining_ms > 0 ->
         {:noreply, defer_retry_for_tracker_cooldown(state, issue.id, attempt, metadata, remaining_ms)}
@@ -1327,18 +1409,16 @@ defmodule SymphonyElixir.Orchestrator do
            )}
       end
     else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+      Logger.debug("No available slots for retrying #{issue_context(issue)}; preserving attempt=#{attempt} until capacity is available")
 
       {:noreply,
        schedule_issue_retry(
          state,
          issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
-           identifier: issue.identifier,
-           error: "no available orchestrator slots",
-           retry_exhaustible: false
-         })
+         attempt,
+         metadata
+         |> Map.put(:identifier, issue.identifier)
+         |> Map.put(:retry_exhaustible, false)
        )}
     end
   end
@@ -1353,6 +1433,17 @@ defmodule SymphonyElixir.Orchestrator do
         retry_after_ms: remaining_ms,
         retry_exhaustible: false
       })
+    )
+  end
+
+  defp defer_retry_for_provider_capacity(state, issue_id, attempt, metadata, remaining_ms) do
+    schedule_issue_retry(
+      state,
+      issue_id,
+      attempt,
+      metadata
+      |> Map.put(:retry_after_ms, remaining_ms)
+      |> Map.put(:retry_exhaustible, false)
     )
   end
 
@@ -1441,12 +1532,40 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp tracker_retry_remaining_ms(%State{}), do: nil
 
+  defp provider_capacity_retry_until_ms(%State{provider_capacity: %{retry_until_ms: retry_until_ms}})
+       when is_integer(retry_until_ms),
+       do: retry_until_ms
+
+  defp provider_capacity_retry_until_ms(%State{}), do: nil
+
+  defp provider_capacity_remaining_ms(%State{} = state) do
+    case provider_capacity_retry_until_ms(state) do
+      retry_until_ms when is_integer(retry_until_ms) ->
+        case retry_until_ms - System.monotonic_time(:millisecond) do
+          remaining_ms when remaining_ms > 0 -> remaining_ms
+          _ -> nil
+        end
+
+      nil ->
+        nil
+    end
+  end
+
+  defp provider_capacity_available?(%State{} = state),
+    do: is_nil(provider_capacity_remaining_ms(state))
+
   defp tracker_cooldown_reason(%State{} = state) do
     {:linear_rate_limited, %{retry_after_ms: tracker_retry_remaining_ms(state) || 1}}
   end
 
   defp tracker_next_poll_delay(%State{} = state) do
-    tracker_retry_remaining_ms(state) || state.poll_interval_ms
+    case tracker_retry_remaining_ms(state) do
+      tracker_retry_ms when is_integer(tracker_retry_ms) ->
+        max(tracker_retry_ms, provider_capacity_remaining_ms(state) || 0)
+
+      nil ->
+        min(state.poll_interval_ms, provider_capacity_remaining_ms(state) || state.poll_interval_ms)
+    end
   end
 
   defp failure_retry_delay(attempt) do
@@ -1713,6 +1832,7 @@ defmodule SymphonyElixir.Orchestrator do
          retrying?: !tracker_available?(state),
          retry_in_ms: tracker_retry_remaining_ms(state)
        },
+       provider_capacity: provider_capacity_snapshot(state),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1754,6 +1874,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil
+
+  defp provider_capacity_snapshot(%State{provider_capacity: nil}), do: nil
+
+  defp provider_capacity_snapshot(%State{provider_capacity: evidence}) when is_map(evidence) do
+    %{
+      schema: Map.get(evidence, :schema),
+      class: Map.get(evidence, :class),
+      reason: Map.get(evidence, :reason),
+      retry_at: Map.get(evidence, :retry_at),
+      retry_in_ms: provider_capacity_remaining_ms(%State{provider_capacity: evidence}),
+      observed_at: Map.get(evidence, :observed_at)
+    }
+  end
 
   defp blocked_issue_url(%{issue: %Issue{url: url}}), do: url
   defp blocked_issue_url(metadata), do: Map.get(metadata, :issue_url)
