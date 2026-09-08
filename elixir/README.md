@@ -172,6 +172,13 @@ Notes:
 - `agent.max_retry_attempts` caps consecutive failure retries before Symphony moves the issue into
   its visible blocked state. Default: `8`. The blocked receipt preserves issue and workspace identity,
   and no further retry timer is scheduled until an operator or tracker-state change resolves it.
+- An `after_create` hook exit with `EX_CONFIG` status `78`, or exit `1` whose output
+  begins with the managed helper's exact `logical path escapes root: ` or
+  `logical path escapes managed roots: ` diagnostic, is also terminal. Preserve it
+  in the existing in-memory blocked ledger while inputs remain unchanged. This
+  ledger does not survive an orchestrator restart: repair the source or installed
+  helper before an explicit release or restart. Unrelated
+  hook failures and timeouts retain bounded retries.
 - A Codex app-server launcher exit with `EX_CONFIG` status `78` is terminal for the unchanged
   configuration. Symphony preserves the failed-turn context in the visible blocked state instead of
   scheduling an identical retry; other non-zero launcher exits continue through normal backoff.

@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, TerminalFailure, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -236,7 +236,7 @@ defmodule SymphonyElixir.Orchestrator do
       input_required_blocker?(running_entry) ->
         block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
 
-      terminal_agent_failure?(reason) ->
+      TerminalFailure.terminal?(reason) ->
         block_terminal_agent_down(state, issue_id, running_entry, session_id, reason)
 
       true ->
@@ -251,20 +251,6 @@ defmodule SymphonyElixir.Orchestrator do
 
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
-
-  # EX_CONFIG (78) is deterministic for an unchanged launcher/configuration.
-  # Retrying the same exact command only burns the issue retry budget and hides
-  # the failed turn behind backoff. Preserve the failure in the blocked ledger
-  # until an operator or tracker-state change provides a real recovery signal.
-  defp terminal_agent_failure?({%AgentRunner.Error{reason: reason}, stacktrace})
-       when is_list(stacktrace),
-       do: terminal_agent_failure?(reason)
-
-  defp terminal_agent_failure?(%AgentRunner.Error{reason: reason}),
-    do: terminal_agent_failure?(reason)
-
-  defp terminal_agent_failure?({:port_exit, 78}), do: true
-  defp terminal_agent_failure?(_reason), do: false
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
