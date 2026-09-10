@@ -1270,6 +1270,277 @@ defmodule SymphonyElixir.CoreTest do
     assert error =~ "75"
   end
 
+  for boundary <- [:before_run, :launcher] do
+    @tag admission_boundary: boundary
+    test "real #{boundary} admission refusal releases claim and resumes only fresh eligible work", %{admission_boundary: boundary} do
+      suffix = System.unique_integer([:positive])
+      root = Path.join(System.tmp_dir!(), "symphony-admission-#{suffix}")
+      held = Path.join(root, "held")
+      launches = Path.join(root, "launches")
+      File.mkdir_p!(root)
+      File.write!(held, "hold")
+      issue = %Issue{id: "admission-#{suffix}", identifier: "JOV-5995", title: "Temporary inventory", state: "In Progress", dispatchable: true}
+      name = Module.concat(__MODULE__, "Admission#{suffix}")
+
+      on_exit(fn -> File.rm_rf(root) end)
+
+      line = ~s(SYMPHONY_LAUNCHER_FAILURE schema=symphony-launcher-failure/v1 class=pr-inventory-unknown retryable=true reason="open_pr_inventory_unknown JOV-5995")
+      refusal = "if test -f #{held}; then printf '%s\\n' '#{line}' >&2; exit 75; fi"
+      launcher = "printf '%s\\n' resumed >> #{launches}; exit 78"
+      binary = Path.join(root, "fake-codex")
+      command = if boundary == :launcher, do: refusal <> "; " <> launcher, else: launcher
+      File.write!(binary, "#!/bin/sh\n" <> command <> "\n")
+      File.chmod!(binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: root,
+        max_retry_attempts: 1,
+        max_concurrent_agents: 5,
+        max_turns: 20,
+        max_retry_backoff_ms: 1_000,
+        poll_interval_ms: 60_000,
+        hook_after_create: "mkdir -p .git",
+        hook_before_run: if(boundary == :before_run, do: refusal, else: nil),
+        codex_command: binary
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      supervisor = start_supervised!({Task.Supervisor, []})
+      pid = start_supervised!({Orchestrator, name: name, task_supervisor: supervisor})
+
+      deferred =
+        eventually_value(fn ->
+          state = :sys.get_state(pid)
+          if state.admission_hold, do: state
+        end)
+
+      assert deferred.admission_hold.class == :pr_inventory_unknown
+      assert deferred.provider_capacity == nil
+
+      assert %{provider_capacity: nil, admission_hold: %{class: :pr_inventory_unknown, identifier: "JOV-5995"}} =
+               SymphonyElixirWeb.Presenter.state_payload(name, 1_000)
+
+      assert deferred.running == %{}
+      assert deferred.retry_attempts == %{}
+      assert deferred.blocked == %{}
+      assert deferred.claimed == MapSet.new()
+      assert_due_in_range(deferred.admission_hold.retry_until_ms, 1, 1_000)
+
+      for _ <- 1..3 do
+        send(pid, :run_poll_cycle)
+        assert :sys.get_state(pid).claimed == MapSet.new()
+        refute File.exists?(launches)
+      end
+
+      # A founder cancellation during the hold must survive recovery.
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [%{issue | state: "Canceled", dispatchable: false}])
+      File.rm!(held)
+      :sys.replace_state(pid, &%{&1 | tracker_retry_until_ms: System.monotonic_time(:millisecond) + 1_200})
+
+      assert eventually_value(
+               fn ->
+                 case Orchestrator.snapshot(name, 1_000) do
+                   %{admission_hold: %{retry_in_ms: nil}} -> true
+                   _ -> nil
+                 end
+               end,
+               200
+             )
+
+      refute File.exists?(launches)
+      # Even an expired admission hold cannot bypass the tracker 429 window.
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      send(pid, :run_poll_cycle)
+      assert :sys.get_state(pid).running == %{}
+      refute File.exists?(launches)
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [%{issue | state: "Canceled", dispatchable: false}])
+
+      assert eventually_value(fn ->
+               state = :sys.get_state(pid)
+               now_ms = System.monotonic_time(:millisecond)
+               if is_nil(state.tracker_retry_until_ms) or state.tracker_retry_until_ms < now_ms, do: true
+             end)
+
+      send(pid, :run_poll_cycle)
+      assert :sys.get_state(pid).claimed == MapSet.new()
+      refute File.exists?(launches)
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      send(pid, :run_poll_cycle)
+      assert eventually_value(fn -> if :sys.get_state(pid).blocked[issue.id], do: true end)
+      assert File.read!(launches) == "resumed\n"
+    end
+  end
+
+  for hold <- [:admission_hold, :provider_capacity] do
+    @tag budget_hold: hold
+    test "valid #{hold} preserves a consumed execution retry through recovery", %{budget_hold: hold} do
+      root = Path.join(System.tmp_dir!(), "symphony-held-budget-#{System.unique_integer([:positive])}")
+      binary = Path.join(root, "fake-codex")
+      count = Path.join(root, "count")
+      finish = Path.join(root, "finish")
+      name = Module.concat(__MODULE__, "HeldBudget#{System.unique_integer([:positive])}")
+      File.mkdir_p!(root)
+
+      on_exit(fn -> File.rm_rf(root) end)
+
+      receipts = %{
+        admission_hold: ~s(SYMPHONY_LAUNCHER_FAILURE schema=symphony-launcher-failure/v1 class=pr-inventory-unknown retryable=true reason="open_pr_inventory_unknown JOV-5995"),
+        provider_capacity: "codex-rotate: CAPACITY_UNAVAILABLE schema=symphony-provider-capacity/v1 class=provider-capacity retryable=true reason=account_cooldown retryAt=unknown waitSeconds=unknown"
+      }
+
+      File.write!(binary, """
+      #!/bin/sh
+      attempt=$(cat '#{count}' 2>/dev/null || echo 0)
+      attempt=$((attempt + 1))
+      echo "$attempt" > '#{count}'
+      if test "$attempt" = 2; then printf '%s\n' '#{receipts[hold]}' >&2; exit 75; fi
+      frame=0
+      while IFS= read -r line; do
+        frame=$((frame + 1))
+        case "$frame" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"budget-thread"}}}' ;;
+          4)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"budget-turn"}}}'
+            if test "$attempt" = 3; then while ! test -f '#{finish}'; do sleep 0.01; done; fi
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"budget-turn","status":"failed","error":{"message":"execution failed"}}}}'
+            exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: root,
+        hook_after_create: "mkdir -p .git",
+        codex_command: binary,
+        max_retry_attempts: 1,
+        max_concurrent_agents: 5,
+        max_turns: 20,
+        max_retry_backoff_ms: 30_000,
+        poll_interval_ms: 60_000
+      )
+
+      issue = %Issue{id: "held-budget", identifier: "JOV-5995", title: "Preserve retry budget", state: "In Progress", dispatchable: true}
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      supervisor = start_supervised!({Task.Supervisor, []})
+      pid = start_supervised!({Orchestrator, name: name, task_supervisor: supervisor})
+
+      # Drive retry tokens explicitly; the assertion must observe the held phase,
+      # not historical hold evidence after a wall-clock timer already resumed it.
+      first_retry = eventually_value(fn -> :sys.get_state(pid).retry_attempts[issue.id] end)
+      assert first_retry.attempt == 1
+      assert File.read!(count) == "1\n"
+      Process.cancel_timer(first_retry.timer_ref)
+      send(pid, {:retry_issue, issue.id, first_retry.retry_token})
+
+      deferred =
+        eventually_value(
+          fn ->
+            state = :sys.get_state(pid)
+            if Map.get(state, hold), do: state
+          end,
+          300
+        )
+
+      assert deferred.retry_attempts[issue.id].attempt == 1
+      assert deferred.claimed == MapSet.new()
+      assert File.read!(count) == "2\n"
+      Process.cancel_timer(deferred.retry_attempts[issue.id].timer_ref)
+      # A candidate poll after cooldown cannot bypass the queued retry's budget.
+      :sys.replace_state(pid, fn state ->
+        Map.update!(state, hold, &Map.put(&1, :retry_until_ms, System.monotonic_time(:millisecond) - 1))
+      end)
+
+      send(pid, :run_poll_cycle)
+      assert :sys.get_state(pid).running == %{}
+      assert File.read!(count) == "2\n"
+      send(pid, {:retry_issue, issue.id, deferred.retry_attempts[issue.id].retry_token})
+
+      resumed =
+        eventually_value(fn ->
+          state = :sys.get_state(pid)
+          if get_in(state.running, [issue.id, :turn_count]) == 1, do: state
+        end)
+
+      assert resumed.running[issue.id].retry_attempt == 1
+      File.write!(finish, "fail the resumed execution")
+
+      blocked =
+        eventually_value(fn ->
+          state = :sys.get_state(pid)
+          if state.blocked[issue.id], do: state
+        end)
+
+      assert blocked.blocked[issue.id].error =~ "retry attempts exhausted"
+      assert blocked.retry_attempts == %{}
+      assert File.read!(count) == "3\n"
+    end
+  end
+
+  test "real before_run mixed machine receipts remain an ordinary hook failure" do
+    root = Path.join(System.tmp_dir!(), "symphony-mixed-hook-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf(root) end)
+    inventory = ~s(SYMPHONY_LAUNCHER_FAILURE schema=symphony-launcher-failure/v1 class=pr-inventory-unknown retryable=true reason="open_pr_inventory_unknown JOV-5995")
+    capacity = "codex-rotate: CAPACITY_UNAVAILABLE schema=symphony-provider-capacity/v1 class=provider-capacity retryable=true reason=account_cooldown retryAt=unknown waitSeconds=unknown"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: root,
+      hook_after_create: "mkdir -p .git",
+      hook_before_run: "printf '%s\\n' '#{inventory}' '#{capacity}' >&2; exit 75"
+    )
+
+    issue = %Issue{id: "mixed-hook", identifier: "JOV-5995", title: "Mixed receipts", state: "In Progress"}
+    error = assert_raise AgentRunner.Error, fn -> AgentRunner.run(issue) end
+    assert {:workspace_hook_failed, "before_run", 75, output} = error.reason
+    assert output =~ inventory
+    assert output =~ capacity
+    assert :error = SymphonyElixir.TemporaryAdmission.from_hook(error.reason)
+  end
+
+  test "typed admission is issue bound and cannot reset an execution failure budget" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retry_attempts: 1,
+      max_concurrent_agents: 5,
+      max_turns: 20
+    )
+
+    pid = start_supervised!({Orchestrator, name: Module.concat(__MODULE__, :AdmissionBudget)})
+    evidence = %{class: :dispatch_admission, retryable: true, identifier: "JOV-5995", reason: "dispatch_gate_closed", retry_at: nil}
+
+    for {reason, session, turns} <- [
+          {{:temporary_admission_unavailable, evidence}, "already-started", 1},
+          {{:temporary_admission_unavailable, %{evidence | identifier: "JOV-5492"}}, nil, 0},
+          {{:port_exit, 75}, nil, 0},
+          {{:workspace_hook_failed, "before_run", 75, "unknown failure"}, nil, 0}
+        ] do
+      ref = make_ref()
+
+      entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: "JOV-5995",
+        issue: %Issue{id: "budget", identifier: "JOV-5995", state: "In Progress"},
+        session_id: session,
+        turn_count: turns,
+        retry_attempt: 1,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn state -> %{state | running: %{"budget" => entry}, claimed: MapSet.new(["budget"]), blocked: %{}, retry_attempts: %{}} end)
+      send(pid, {:DOWN, ref, :process, self(), {%AgentRunner.Error{message: "failed", reason: reason}, []}})
+      state = :sys.get_state(pid)
+      assert state.admission_hold == nil
+      assert state.blocked["budget"].error =~ "retry attempts exhausted"
+      assert state.retry_attempts == %{}
+    end
+  end
+
   test "typed pre-session provider capacity pauses admission without walking the backlog" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

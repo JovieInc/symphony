@@ -711,6 +711,17 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule exponential-backoff retry.
 
+- `Typed Temporary Admission Refusal` (implementation extension)
+  - Only an exact, unambiguous machine receipt paired with exit 75 before execution qualifies.
+    Launcher recognition ends when initialize succeeds; before_run may provide a matching
+    issue-bound inventory/admission receipt. Later request phases cannot prove execution absent.
+  - Release the issue claim without consuming an execution retry, retain truthful provider or
+    admission evidence separately, and pause new admission through a bounded cooldown.
+  - Keep running-work reconciliation and tracker rate-limit gates. On expiry, re-fetch current
+    eligibility and rerun prerequisites; never override terminal state or issue exclusion.
+  - Generic/malformed/conflicting refusals remain ordinary failures. In-memory cooldown survives
+    config reload but not process restart; a restart must rerun the same admission prerequisites.
+
 - `Codex Update Event`
   - Update live session fields, token counters, and rate limits.
 

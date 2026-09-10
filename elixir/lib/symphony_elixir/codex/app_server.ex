@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH, TemporaryAdmission}
 
   @initialize_id 1
   @thread_start_id 2
@@ -959,9 +959,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         with_timeout_response(port, request_id, timeout_ms, "", capacity_evidence)
 
       {:error, _} ->
-        case provider_capacity_receipt(payload) do
+        case pre_session_receipt(request_id, payload) do
           {:ok, evidence} ->
-            with_timeout_response(port, request_id, timeout_ms, "", evidence)
+            with_timeout_response(port, request_id, timeout_ms, "", merge_receipt(capacity_evidence, evidence))
 
           :error ->
             log_non_json_stream_line(payload, "response stream")
@@ -969,6 +969,28 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
     end
   end
+
+  defp pre_session_receipt(@initialize_id, payload) do
+    case provider_capacity_receipt(payload) do
+      {:ok, evidence} -> {:ok, evidence}
+      :error -> temporary_admission_receipt(payload)
+    end
+  end
+
+  defp pre_session_receipt(_request_id, _payload), do: :error
+
+  defp temporary_admission_receipt(payload) do
+    case TemporaryAdmission.parse_line(payload) do
+      {:ok, evidence} ->
+        {:ok, evidence}
+
+      :error ->
+        if String.contains?(payload, ["SYMPHONY_LAUNCHER_FAILURE", "CAPACITY_UNAVAILABLE"]), do: {:ok, :ambiguous}, else: :error
+    end
+  end
+
+  defp merge_receipt(nil, evidence), do: evidence
+  defp merge_receipt(_existing, _evidence), do: :ambiguous
 
   defp provider_capacity_receipt(payload) when is_binary(payload) do
     with %{"reason" => reason, "retry_at" => retry_at, "wait_seconds" => wait_seconds} <-
@@ -998,8 +1020,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp provider_capacity_exit_response(75, evidence) when is_map(evidence),
+  defp provider_capacity_exit_response(75, %{class: :provider_capacity} = evidence),
     do: {:error, {:provider_capacity_unavailable, evidence}}
+
+  defp provider_capacity_exit_response(75, %{class: class} = evidence)
+       when class in [:pr_inventory_unknown, :dispatch_admission],
+       do: {:error, {:temporary_admission_unavailable, evidence}}
 
   defp provider_capacity_exit_response(status, _evidence), do: {:error, {:port_exit, status}}
 
