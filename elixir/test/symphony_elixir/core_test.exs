@@ -1282,10 +1282,7 @@ defmodule SymphonyElixir.CoreTest do
       issue = %Issue{id: "admission-#{suffix}", identifier: "JOV-5995", title: "Temporary inventory", state: "In Progress", dispatchable: true}
       name = Module.concat(__MODULE__, "Admission#{suffix}")
 
-      on_exit(fn ->
-        if pid = Process.whereis(name), do: GenServer.stop(pid)
-        File.rm_rf(root)
-      end)
+      on_exit(fn -> File.rm_rf(root) end)
 
       line = ~s(SYMPHONY_LAUNCHER_FAILURE schema=symphony-launcher-failure/v1 class=pr-inventory-unknown retryable=true reason="open_pr_inventory_unknown JOV-5995")
       refusal = "if test -f #{held}; then printf '%s\\n' '#{line}' >&2; exit 75; fi"
@@ -1309,8 +1306,8 @@ defmodule SymphonyElixir.CoreTest do
       )
 
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
-      {:ok, supervisor} = Task.Supervisor.start_link()
-      {:ok, pid} = Orchestrator.start_link(name: name, task_supervisor: supervisor)
+      supervisor = start_supervised!({Task.Supervisor, []})
+      pid = start_supervised!({Orchestrator, name: name, task_supervisor: supervisor})
 
       deferred =
         eventually_value(fn ->
@@ -1385,10 +1382,7 @@ defmodule SymphonyElixir.CoreTest do
       name = Module.concat(__MODULE__, "HeldBudget#{System.unique_integer([:positive])}")
       File.mkdir_p!(root)
 
-      on_exit(fn ->
-        if pid = Process.whereis(name), do: GenServer.stop(pid)
-        File.rm_rf(root)
-      end)
+      on_exit(fn -> File.rm_rf(root) end)
 
       receipts = %{
         admission_hold: ~s(SYMPHONY_LAUNCHER_FAILURE schema=symphony-launcher-failure/v1 class=pr-inventory-unknown retryable=true reason="open_pr_inventory_unknown JOV-5995"),
@@ -1427,14 +1421,22 @@ defmodule SymphonyElixir.CoreTest do
         max_retry_attempts: 1,
         max_concurrent_agents: 5,
         max_turns: 20,
-        max_retry_backoff_ms: 1_000,
+        max_retry_backoff_ms: 30_000,
         poll_interval_ms: 60_000
       )
 
       issue = %Issue{id: "held-budget", identifier: "JOV-5995", title: "Preserve retry budget", state: "In Progress", dispatchable: true}
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
-      {:ok, supervisor} = Task.Supervisor.start_link()
-      {:ok, pid} = Orchestrator.start_link(name: name, task_supervisor: supervisor)
+      supervisor = start_supervised!({Task.Supervisor, []})
+      pid = start_supervised!({Orchestrator, name: name, task_supervisor: supervisor})
+
+      # Drive retry tokens explicitly; the assertion must observe the held phase,
+      # not historical hold evidence after a wall-clock timer already resumed it.
+      first_retry = eventually_value(fn -> :sys.get_state(pid).retry_attempts[issue.id] end)
+      assert first_retry.attempt == 1
+      assert File.read!(count) == "1\n"
+      Process.cancel_timer(first_retry.timer_ref)
+      send(pid, {:retry_issue, issue.id, first_retry.retry_token})
 
       deferred =
         eventually_value(
@@ -1448,6 +1450,7 @@ defmodule SymphonyElixir.CoreTest do
       assert deferred.retry_attempts[issue.id].attempt == 1
       assert deferred.claimed == MapSet.new()
       assert File.read!(count) == "2\n"
+      Process.cancel_timer(deferred.retry_attempts[issue.id].timer_ref)
       # A candidate poll after cooldown cannot bypass the queued retry's budget.
       :sys.replace_state(pid, fn state ->
         Map.update!(state, hold, &Map.put(&1, :retry_until_ms, System.monotonic_time(:millisecond) - 1))
@@ -1507,8 +1510,7 @@ defmodule SymphonyElixir.CoreTest do
       max_turns: 20
     )
 
-    {:ok, pid} = Orchestrator.start_link(name: Module.concat(__MODULE__, :AdmissionBudget))
-    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+    pid = start_supervised!({Orchestrator, name: Module.concat(__MODULE__, :AdmissionBudget)})
     evidence = %{class: :dispatch_admission, retryable: true, identifier: "JOV-5995", reason: "dispatch_gate_closed", retry_at: nil}
 
     for {reason, session, turns} <- [
