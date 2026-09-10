@@ -33,6 +33,9 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  # Also bounds unknown-duration typed temporary admission/provider holds.
+  # A hold releases the claim and rechecks current eligibility after this wait.
+  max_retry_backoff_ms: 300000
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never

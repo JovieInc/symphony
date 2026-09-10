@@ -172,6 +172,20 @@ Notes:
 - `agent.max_retry_attempts` caps consecutive failure retries before Symphony moves the issue into
   its visible blocked state. Default: `8`. The blocked receipt preserves issue and workspace identity,
   and no further retry timer is scheduled until an operator or tracker-state change resolves it.
+- Exact typed temporary refusals before execution release the claim and pause admission without
+  consuming execution retries. If an earlier execution already failed, its retry entry keeps the
+  same attempt and remains excluded from candidate dispatch until that retry resumes. Provider capacity uses the existing `codex-rotate:` receipt;
+  temporary inventory and dispatch checks use `symphony-launcher-failure/v1` with
+  `pr-inventory-unknown` or the whitelisted `pickup-refused` dispatch reasons. The latter appears
+  separately as `admission_hold` in the status snapshot, never as provider capacity.
+  Receipts require exit `75`, an exact single machine line, and the running issue's identifier.
+  Launcher receipts are recognized only while awaiting `initialize`; `before_run` hook failures
+  use the same admission parser. Once initialization succeeds, execution is not assumed absent.
+  Generic, malformed, conflicting, wrong-issue, and later-phase receipts retain normal failure handling.
+  Unknown waits use `agent.max_retry_backoff_ms`; all waits are clamped to 1 second through
+  24 hours. Holds are in memory: reload preserves them, restart
+  rechecks the real launcher/hook prerequisites. Cooldown expiry re-fetches current eligibility,
+  preserves tracker rate-limit gates, and never grants capacity or overrides cancellation.
 - An `after_create` hook exit with `EX_CONFIG` status `78`, or exit `1` whose output
   begins with the managed helper's exact `logical path escapes root: ` or
   `logical path escapes managed roots: ` diagnostic, is also terminal. Preserve it
@@ -181,7 +195,7 @@ Notes:
   hook failures and timeouts retain bounded retries.
 - A Codex app-server launcher exit with `EX_CONFIG` status `78` is terminal for the unchanged
   configuration. Symphony preserves the failed-turn context in the visible blocked state instead of
-  scheduling an identical retry; other non-zero launcher exits continue through normal backoff.
+  scheduling an identical retry; other non-zero launcher exits continue through normal backoff except the exact temporary refusals above.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

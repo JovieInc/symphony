@@ -136,6 +136,67 @@ defmodule SymphonyElixir.AppServerTest do
              run_pre_session_launcher("codex-rotate: provider unavailable", 75)
   end
 
+  test "app server recognizes exact temporary inventory and admission refusal only with exit 75" do
+    for {class, reason, suffix} <- [
+          {"pr-inventory-unknown", "open_pr_inventory_unknown", "JOV-5995"},
+          {"pickup-refused", "dispatch_gate_closed", "owns JOV-5995"},
+          {"pickup-refused", "dispatch_admission_unavailable", "owns JOV-5995"}
+        ] do
+      line = ~s(SYMPHONY_LAUNCHER_FAILURE schema=symphony-launcher-failure/v1 class=#{class} retryable=true reason="#{reason} #{suffix}")
+
+      assert {:error, {:temporary_admission_unavailable, %{reason: ^reason, identifier: "JOV-5995"}}} =
+               run_pre_session_launcher(line <> "\n" <> Jason.encode!(%{"method" => "server/notice"}), 75)
+
+      assert {:error, {:port_exit, 78}} = run_pre_session_launcher(line, 78)
+
+      for malformed <- ["prefix " <> line, String.replace(line, "retryable=true", "retryable=false"), line <> " extra=true"] do
+        assert {:error, {:port_exit, 75}} = run_pre_session_launcher(malformed, 75)
+      end
+    end
+  end
+
+  test "ambiguous or malformed machine receipt streams fail closed" do
+    line = ~s(SYMPHONY_LAUNCHER_FAILURE schema=symphony-launcher-failure/v1 class=pr-inventory-unknown retryable=true reason="open_pr_inventory_unknown JOV-5995")
+
+    for first <- [line, String.replace(line, "JOV-5995", "JOV-5492"), @provider_capacity_line, "prefix " <> line] do
+      assert {:error, {:port_exit, 75}} = run_pre_session_launcher(first <> "\n" <> line, 75)
+      assert {:error, {:port_exit, 75}} = run_pre_session_launcher(line <> "\n" <> first, 75)
+    end
+  end
+
+  test "machine receipt after turn start was sent cannot authorize redispatch before acknowledgement" do
+    root = Path.join(System.tmp_dir!(), "symphony-ambiguous-turn-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "JOV-5995")
+    binary = Path.join(root, "fake-codex")
+    trace = Path.join(root, "trace")
+    File.mkdir_p!(Path.join(workspace, ".git"))
+    on_exit(fn -> File.rm_rf(root) end)
+    admission = ~s(SYMPHONY_LAUNCHER_FAILURE schema=symphony-launcher-failure/v1 class=pr-inventory-unknown retryable=true reason="open_pr_inventory_unknown JOV-5995")
+
+    for receipt <- [admission, @provider_capacity_line] do
+      File.write!(binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        printf '%s\n' "$line" >> '#{trace}'
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-test"}}}' ;;
+          4) printf '%s\n' '#{receipt}' >&2; exit 75 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
+      issue = %Issue{id: "issue-ambiguous", identifier: "JOV-5995", title: "Ambiguous execution", state: "In Progress"}
+      assert {:error, {:port_exit, 75}} = AppServer.run(workspace, "do work", issue)
+      assert File.read!(trace) =~ ~s("method":"turn/start")
+    end
+  end
+
   test "completed protocol frames with failed turn status remain failures" do
     test_root =
       Path.join(

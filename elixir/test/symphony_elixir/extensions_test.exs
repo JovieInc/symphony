@@ -240,7 +240,8 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
-    snapshot = static_snapshot()
+    hold = %{class: :pr_inventory_unknown, identifier: "JOV-5995", reason: "open_pr_inventory_unknown", retry_in_ms: 1_000}
+    snapshot = static_snapshot() |> Map.put(:admission_hold, hold)
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
 
     {:ok, _pid} =
@@ -320,7 +321,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "provider_capacity" => nil,
+             "admission_hold" => %{
+               "class" => "pr_inventory_unknown",
+               "identifier" => "JOV-5995",
+               "reason" => "open_pr_inventory_unknown",
+               "retry_in_ms" => 1_000
+             }
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")

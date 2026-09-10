@@ -10,6 +10,10 @@ _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), S
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 
+The Elixir implementation preserves eligible work through typed temporary inventory, admission,
+and provider-capacity holds. It rechecks prerequisites after a bounded wait; a hold never grants
+execution permission. See [the runtime contract](elixir/README.md) for accepted receipts.
+
 ## Running Symphony
 
 ### Requirements
