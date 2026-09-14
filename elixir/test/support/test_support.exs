@@ -95,6 +95,7 @@ defmodule SymphonyElixir.TestSupport do
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
           tracker_project_slug: "project",
+          tracker_team_key: nil,
           tracker_assignee: nil,
           tracker_required_labels: [],
           tracker_excluded_labels: ["no-symphony", "codex-in-progress"],
@@ -135,6 +136,7 @@ defmodule SymphonyElixir.TestSupport do
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
+    tracker_team_key = Keyword.get(config, :tracker_team_key)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_required_labels = Keyword.get(config, :tracker_required_labels)
     tracker_excluded_labels = Keyword.get(config, :tracker_excluded_labels)
@@ -168,6 +170,16 @@ defmodule SymphonyElixir.TestSupport do
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
 
+    provider_section =
+      if is_binary(tracker_team_key) do
+        [
+          "  provider:",
+          "    team_key: #{yaml_value(tracker_team_key)}"
+        ]
+      else
+        []
+      end
+
     sections =
       [
         "---",
@@ -181,6 +193,7 @@ defmodule SymphonyElixir.TestSupport do
         "  excluded_labels: #{yaml_value(tracker_excluded_labels)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
+        provider_section,
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
@@ -206,6 +219,7 @@ defmodule SymphonyElixir.TestSupport do
         "---",
         prompt
       ]
+      |> List.flatten()
       |> Enum.reject(&(&1 in [nil, ""]))
 
     Enum.join(sections, "\n") <> "\n"

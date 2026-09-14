@@ -17,7 +17,7 @@ defmodule SymphonyElixir.Linear.Adapter do
       not present_string?(tracker_settings.api_key) ->
         {:error, :missing_linear_api_token}
 
-      not present_string?(tracker_settings.project_slug) ->
+      match?({:error, _}, scope_for(tracker_settings)) ->
         {:error, :missing_linear_project_slug}
 
       not is_nil(tracker_settings.assignee) and not present_string?(tracker_settings.assignee) ->
@@ -25,6 +25,28 @@ defmodule SymphonyElixir.Linear.Adapter do
 
       true ->
         :ok
+    end
+  end
+
+  @doc """
+  Returns the configured Linear read scope.
+
+  Project-scoped workflows keep their existing behavior. A workflow may instead
+  provide `tracker.provider.team_key`, which lets the runtime query the whole
+  team without inventing a project boundary. The caller still owns any label,
+  state, admission, and execution restrictions layered on top of this scope.
+  """
+  @spec scope_for(map()) :: {:ok, {:project | :team, String.t()}} | {:error, atom()}
+  def scope_for(tracker_settings) do
+    cond do
+      present_string?(tracker_settings.project_slug) ->
+        {:ok, {:project, tracker_settings.project_slug}}
+
+      present_string?(provider_value(tracker_settings, "team_key")) ->
+        {:ok, {:team, provider_value(tracker_settings, "team_key")}}
+
+      true ->
+        {:error, :missing_linear_project_slug}
     end
   end
 
@@ -47,6 +69,10 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
+  end
+
+  defp provider_value(%{provider: provider}, "team_key") when is_map(provider) do
+    Map.get(provider, "team_key")
   end
 
   defp present_string?(value) when is_binary(value), do: String.trim(value) != ""

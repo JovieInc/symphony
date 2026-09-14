@@ -3,6 +3,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
+  alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Linear.Client
 
   test "workspace bootstrap can be implemented in after_create hook" do
@@ -611,6 +612,86 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                       first: 5,
                       relationFirst: 50
                     }}
+  end
+
+  test "linear client uses the team filter for team-scoped issue refreshes" do
+    graphql_fun = fn query, variables ->
+      send(self(), {:team_issue_states_page, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-team",
+                 "identifier" => "SYME2E-1",
+                 "title" => "Team issue",
+                 "state" => %{"name" => "Todo"},
+                 "labels" => %{"nodes" => []},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ]
+           }
+         }
+       }}
+    end
+
+    assert {:ok, [%Issue{identifier: "SYME2E-1"}]} =
+             Client.fetch_issues_by_ids_for_test(["issue-team"], {:team, "SYME2E"}, graphql_fun)
+
+    assert_receive {:team_issue_states_page, query,
+                    %{
+                      ids: ["issue-team"],
+                      teamKey: "SYME2E",
+                      first: 1,
+                      relationFirst: 50
+                    }}
+
+    assert query =~ "SymphonyLinearTeamIssuesById"
+    assert query =~ "team: {key: {eq: $teamKey}}"
+    refute query =~ "projectSlug"
+  end
+
+  test "linear client uses the team filter for team-scoped candidate polling" do
+    graphql_fun = fn query, variables ->
+      send(self(), {:team_poll_page, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-team-poll",
+                 "identifier" => "SYME2E-2",
+                 "title" => "Team candidate",
+                 "state" => %{"name" => "Todo"},
+                 "labels" => %{"nodes" => []},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, [%Issue{identifier: "SYME2E-2"}]} =
+             Client.fetch_issues_by_states_for_test(["Todo"], {:team, "SYME2E"}, graphql_fun)
+
+    assert_receive {:team_poll_page, query,
+                    %{
+                      teamKey: "SYME2E",
+                      stateNames: ["Todo"],
+                      first: 50,
+                      relationFirst: 50,
+                      after: nil
+                    }}
+
+    assert query =~ "SymphonyLinearTeamPoll"
+    assert query =~ "team: {key: {eq: $teamKey}}"
+    refute query =~ "projectSlug"
   end
 
   test "linear client logs response bodies for non-200 graphql responses" do
@@ -1276,6 +1357,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "assignee" => nil,
              "extra" => %{"team" => "platform"}
            }
+  end
+
+  test "linear adapter accepts a team provider scope without a project" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "linear",
+                 provider: %{api_key: "provider-token", team_key: "SYME2E"}
+               }
+             })
+
+    assert :ok = Config.validate_settings(settings)
+    assert settings.tracker.project_slug == nil
+    assert settings.tracker.provider["team_key"] == "SYME2E"
+    assert {:ok, {:team, "SYME2E"}} = Adapter.scope_for(settings.tracker)
   end
 
   test "linear adapter rejects invalid provider values without crashing config parsing" do

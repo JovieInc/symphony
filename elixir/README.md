@@ -144,8 +144,9 @@ Notes:
 
 - If a value is missing, defaults are used.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
-  `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
-  `api_key`, `project_slug`, and `assignee` aliases for compatibility.
+  `tracker.provider`; the Linear adapter accepts either `project_slug` for project-scoped intake
+  or `team_key` for team-scoped intake. The older flat `endpoint`, `api_key`, `project_slug`, and
+  `assignee` aliases remain supported for compatibility.
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
@@ -235,12 +236,12 @@ codex:
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default
   `https://api.linear.app/graphql`), `api_key` (defaults to `LINEAR_API_KEY` and accepts
-  `$VAR`), required `project_slug`, and optional `assignee` (a Linear user ID or `me`,
-  defaulting to `LINEAR_ASSIGNEE`).
+  `$VAR`), exactly one of `project_slug` or `team_key`, and optional `assignee` (a Linear user ID
+  or `me`, defaulting to `LINEAR_ASSIGNEE`).
   The legacy flat `tracker.endpoint`, `api_key`, `project_slug`, and `assignee` aliases remain
   supported. `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
-- Scope and paging: candidate reads filter the configured project slug and requested state names,
-  following Linear pages of 50. ID refreshes are also project-scoped and batch up to 50 IDs. Empty
+- Scope and paging: candidate reads filter the configured project or team and requested state names,
+  following Linear pages of 50. ID refreshes use the same scope and batch up to 50 IDs. Empty
   state/ID lists return `{:ok, []}` without a Linear request.
 - Identity and normalization: `issue.id` is the Linear issue ID and `issue.native_ref` is currently
   `nil`. Records missing a nonblank ID, identifier, title, or state are dropped from candidate
@@ -258,7 +259,8 @@ codex:
   whatever the configured Linear token can access.
 - Responsibility and errors: `linear_graphql` adds no idempotency key, retry, scope guard, or
   rate-limit policy, so workflows own idempotent mutations and handling provider errors. Read/config
-  failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
+  failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}` when
+  neither a project nor team scope is configured,
   `{:error, :invalid_linear_endpoint}`, `{:error, :invalid_linear_assignee}`,
   `{:error, :missing_linear_viewer_identity}`, `{:error, {:linear_api_status, status}}`,
   `{:error, {:linear_rate_limited, details}}`,
