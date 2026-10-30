@@ -1,0 +1,19 @@
+{
+  ".codex/skills/land/land_watch.py": 621,
+  "elixir/lib/symphony_elixir/codex/app_server.ex": 1164,
+  "elixir/lib/symphony_elixir/config/schema.ex": 663,
+  "elixir/lib/symphony_elixir/jira/client.ex": 532,
+  "elixir/lib/symphony_elixir/linear/client.ex": 759,
+  "elixir/lib/symphony_elixir/orchestrator.ex": 2425,
+  "elixir/lib/symphony_elixir/status_dashboard.ex": 1941,
+  "elixir/lib/symphony_elixir/workspace.ex": 595,
+  "elixir/test/symphony_elixir/app_server_test.exs": 1869,
+  "elixir/test/symphony_elixir/core_test.exs": 3428,
+  "elixir/test/symphony_elixir/extensions_test.exs": 798,
+  "elixir/test/symphony_elixir/gitlab_adapter_test.exs": 501,
+  "elixir/test/symphony_elixir/jira_adapter_test.exs": 609,
+  "elixir/test/symphony_elixir/jira_live_e2e_test.exs": 533,
+  "elixir/test/symphony_elixir/live_e2e_test.exs": 837,
+  "elixir/test/symphony_elixir/orchestrator_status_test.exs": 1803,
+  "elixir/test/symphony_elixir/workspace_and_config_test.exs": 1845
+}
